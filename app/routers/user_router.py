@@ -4,6 +4,12 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.services import user_service
 from app.models.schemas import UpdateAccountRequest
+from pydantic import BaseModel
+import uuid
+
+class PhantomUserRequest(BaseModel):
+    email: str
+    name: str = ""
 
 router = APIRouter()
 
@@ -38,3 +44,36 @@ async def update_account(
     if not result:
         raise HTTPException(status_code=500, detail="Failed to update account details")
     return {"message": "Success"}
+
+@router.get("/user/invites")
+async def get_invites(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Get list of users invited by the current user."""
+    account = await user_service.get_user_account(db, current_user["uid"])
+    if not account or not account.get("friendCode"):
+        return []
+    invites = await user_service.get_invited_users(db, account["friendCode"])
+    return invites
+
+@router.post("/user/phantom")
+async def create_phantom_user(
+    request: PhantomUserRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Create or find a phantom user by email."""
+    # First check if user exists
+    user = await db.users.find_one({"email": request.email})
+    if user:
+        return user_service.serialize_doc(user)
+        
+    # Generate random uid for phantom
+    phantom_uid = f"phantom_{uuid.uuid4().hex}"
+    
+    user = await user_service.find_or_create_user(
+        db, uid=phantom_uid, email=request.email, name=request.name or request.email.split("@")[0]
+    )
+    return user
+

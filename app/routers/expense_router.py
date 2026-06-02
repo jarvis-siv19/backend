@@ -3,14 +3,14 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
 from app.services import expense_service, user_service
-from app.models.schemas import PersonalExpensesRequest
+from app.models.schemas import PersonalExpensesRequest, ExpenseCreate, ExpenseUpdate
 
 router = APIRouter()
 
 
 @router.post("/expense")
 async def create_expense(
-    request: Request,
+    request: ExpenseCreate,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -19,7 +19,7 @@ async def create_expense(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    request_data = await request.json()
+    request_data = request.model_dump(by_alias=True)
     try:
         result = await expense_service.create_expense(db, user_id, request_data)
         return result
@@ -47,7 +47,7 @@ async def get_expense(
 @router.put("/expense/{expense_id}")
 async def update_expense(
     expense_id: str,
-    request: Request,
+    request: ExpenseUpdate,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -56,7 +56,7 @@ async def update_expense(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    request_data = await request.json()
+    request_data = request.model_dump(by_alias=True)
     result = await expense_service.update_expense(db, user_id, expense_id, request_data)
     return result
 

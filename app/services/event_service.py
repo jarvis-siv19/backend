@@ -40,6 +40,7 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
             "$group": {
                 "_id": "$_id",
                 "eventName": {"$first": "$eventName"},
+                "description": {"$first": "$description"},
                 "createdAt": {"$first": "$createdAt"},
                 "createdBy": {"$first": "$createdBy"},
                 "users": {"$first": "$users"},
@@ -70,6 +71,7 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
             "id": str(event["_id"]),
             "users": [str(u) for u in event.get("users", [])],
             "eventName": event.get("eventName", ""),
+            "description": event.get("description", ""),
             "createdAt": str(event.get("createdAt", "")),
             "createdBy": str(event.get("createdBy", "")),
             "expenses": [str(exp["_id"]) for exp in event.get("expenses", [])],
@@ -216,6 +218,7 @@ async def save_event(
 
         update_data = {
             "eventName": request_data.get("eventName", event.get("eventName")),
+            "description": request_data.get("description", event.get("description", "")),
             "users": new_user_ids,
             "updatedBy": ObjectId(user_id),
             "updatedAt": now,
@@ -239,6 +242,7 @@ async def save_event(
 
         new_event = {
             "eventName": request_data.get("eventName", "Untitled Event"),
+            "description": request_data.get("description", ""),
             "users": user_ids,
             "expenses": [],
             "createdBy": creator_oid,

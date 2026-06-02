@@ -1,13 +1,19 @@
 import json
 import traceback
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from google import genai
 from app.config import settings
+from datetime import datetime, timezone
+from .llm.provider_base import BaseLLMProvider
+from .llm.google_provider import GoogleGeminiProvider
+from .llm.ollama_provider import OllamaProvider
 
 
-def _get_client() -> genai.Client:
-    """Get a configured Gemini API client."""
-    return genai.Client(api_key=settings.GEMINI_API_KEY)
+def get_llm_provider(model_name: str) -> BaseLLMProvider:
+    """Factory to get the correct provider based on model name."""
+    if model_name.startswith("gemini-"):
+        return GoogleGeminiProvider()
+    else:
+        return OllamaProvider()
 
 
 async def get_prompt(db: AsyncIOMotorDatabase, prompt_type: str) -> dict | None:
@@ -23,7 +29,7 @@ async def generate_text_content(
     db: AsyncIOMotorDatabase, prompt_type: str, user_input: str
 ) -> tuple[str | None, str | None]:
     """
-    Generate text content using Google Gemini API.
+    Generate text content using generic LLM API.
     Fetches the prompt from the database and appends user input.
     Returns (result, error).
     """
@@ -36,13 +42,13 @@ async def generate_text_content(
     full_prompt = prompt_text + user_input
 
     try:
-        client = _get_client()
-        response = client.models.generate_content(
-            model=settings.GEMINI_MODEL,
-            contents=full_prompt,
-        )
+        # Fetch active model from DB
+        settings_doc = await db.settings.find_one({"_id": "llm_settings"})
+        active_model = settings_doc.get("activeModel", settings.GEMINI_MODEL) if settings_doc else settings.GEMINI_MODEL
 
-        result_text = response.text
+        provider = get_llm_provider(active_model)
+        result_text, stats = await provider.generate_content(active_model, full_prompt)
+
         # Clean up the response
         result_text = (
             result_text.replace("`", "")
@@ -55,6 +61,21 @@ async def generate_text_content(
         await db.prompts.update_one(
             {"_id": prompt_doc["_id"]},
             {"$inc": {"hits": 1, "successHits": 1}},
+        )
+
+        # Update model global stats
+        await db.llm_stats.update_one(
+            {"model": active_model},
+            {
+                "$inc": {
+                    "totalRequests": 1,
+                    "promptTokens": stats["prompt_tokens"],
+                    "completionTokens": stats["completion_tokens"],
+                    "totalTokens": stats["total_tokens"],
+                },
+                "$set": {"lastUsedAt": datetime.now(timezone.utc)}
+            },
+            upsert=True
         )
 
         return result_text, None

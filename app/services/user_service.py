@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from argon2 import PasswordHasher
+from fastapi import HTTPException
 
 ph = PasswordHasher()
 
@@ -43,7 +44,7 @@ def serialize_doc(doc: dict) -> dict:
 
 
 async def find_or_create_user(
-    db: AsyncIOMotorDatabase, uid: str, email: str, name: str = "", password: str = ""
+    db: AsyncIOMotorDatabase, uid: str, email: str, name: str = "", password: str = "", invite_code: str = ""
 ) -> dict:
     """Find user by Firebase UID, or create one if not exists."""
     user = await db.users.find_one({"firebaseUid": uid})
@@ -53,26 +54,50 @@ async def find_or_create_user(
     # Also check by email for backward compatibility
     user = await db.users.find_one({"email": email})
     if user:
-        # Link Firebase UID to existing user
-        await db.users.update_one(
-            {"_id": user["_id"]}, {"$set": {"firebaseUid": uid}}
-        )
-        user["firebaseUid"] = uid
+        # Ensure legacy users get a friend code
+        if not user.get("friendCode"):
+            friend_code = generate_friend_code(8)
+            while await db.users.find_one({"friendCode": friend_code}):
+                friend_code = generate_friend_code(8)
+            await db.users.update_one(
+                {"_id": user["_id"]}, 
+                {"$set": {"firebaseUid": uid, "friendCode": friend_code}}
+            )
+            user["firebaseUid"] = uid
+            user["friendCode"] = friend_code
+        else:
+            # Link Firebase UID to existing user
+            await db.users.update_one(
+                {"_id": user["_id"]}, {"$set": {"firebaseUid": uid}}
+            )
+            user["firebaseUid"] = uid
         return serialize_doc(user)
 
-    # Create new user
+    # Create new user safely handling concurrent requests
     now = datetime.now(timezone.utc)
-    friend_code = generate_friend_code(8)
+    
+    # Check if this is the first user
+    user_count = await db.users.count_documents({})
+    is_first_user = user_count == 0
+    role = "admin" if is_first_user else "user"
+    invited_by = None
+    
+    if not is_first_user:
+        if not invite_code:
+            raise HTTPException(status_code=400, detail="Invite code is required for registration.")
+        # Validate invite code (friendCode)
+        inviter = await db.users.find_one({"friendCode": invite_code})
+        if not inviter:
+            raise HTTPException(status_code=400, detail="Invalid invite code.")
+        invited_by = invite_code
 
-    # Ensure friend code is unique
-    while await db.users.find_one({"friendCode": friend_code}):
-        friend_code = generate_friend_code(8)
+    friend_code = generate_friend_code(8)
 
     password_hash = ""
     if password:
         password_hash = ph.hash(password)
 
-    new_user = {
+    new_user_data = {
         "firebaseUid": uid,
         "email": email,
         "name": name or email.split("@")[0],
@@ -80,12 +105,61 @@ async def find_or_create_user(
         "upiId": "",
         "friends": [],
         "password": password_hash,
+        "role": role,
+        "invitedBy": invited_by,
         "createdAt": now,
         "updatedAt": now,
     }
-    result = await db.users.insert_one(new_user)
-    new_user["_id"] = result.inserted_id
-    return serialize_doc(new_user)
+    
+    import pymongo
+    try:
+        from pymongo import ReturnDocument
+        # Using find_one_and_update with upsert=True prevents race conditions where
+        # two concurrent requests both see no user and both try to insert.
+        updated_user = await db.users.find_one_and_update(
+            {"firebaseUid": uid},
+            {"$setOnInsert": new_user_data},
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+        
+        # Link phantom user expenses
+        await link_phantom_expenses(db, email, str(updated_user["_id"]))
+        
+        return serialize_doc(updated_user)
+    except pymongo.errors.DuplicateKeyError:
+        # Just in case there is a friendCode collision or another edge case, fallback to find
+        user = await db.users.find_one({"firebaseUid": uid})
+        if user:
+            return serialize_doc(user)
+        # If it still fails, it's a very rare friendCode collision, retry with a new code
+        new_user_data["friendCode"] = generate_friend_code(8)
+        updated_user = await db.users.find_one_and_update(
+            {"firebaseUid": uid},
+            {"$setOnInsert": new_user_data},
+            upsert=True,
+            return_document=ReturnDocument.AFTER
+        )
+        
+        # Link phantom user expenses
+        await link_phantom_expenses(db, email, str(updated_user["_id"]))
+        
+        return serialize_doc(updated_user)
+
+
+async def link_phantom_expenses(db: AsyncIOMotorDatabase, email: str, user_id_str: str):
+    """Link expenses where the user was invited by email before registration."""
+    # We update shares where email matches, setting the userId
+    await db.expenses.update_many(
+        {"shares.email": email},
+        {"$set": {"shares.$[elem].userId": user_id_str}},
+        array_filters=[{"elem.email": email}]
+    )
+    await db.expenses.update_many(
+        {"payShares.email": email},
+        {"$set": {"payShares.$[elem].userId": user_id_str}},
+        array_filters=[{"elem.email": email}]
+    )
 
 
 async def get_user_by_firebase_uid(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
@@ -114,13 +188,26 @@ async def get_user_account(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
     user = await db.users.find_one({"firebaseUid": uid})
     if not user:
         return None
+        
+    friend_code = user.get("friendCode", "")
+    if not friend_code:
+        # Auto-generate if missing
+        friend_code = generate_friend_code(8)
+        while await db.users.find_one({"friendCode": friend_code}):
+            friend_code = generate_friend_code(8)
+        await db.users.update_one(
+            {"_id": user["_id"]}, {"$set": {"friendCode": friend_code}}
+        )
+
     return {
         "id": str(user["_id"]),
         "email": user.get("email", ""),
         "name": user.get("name", ""),
-        "friendCode": user.get("friendCode", ""),
+        "friendCode": friend_code,
         "upiId": user.get("upiId", ""),
-        "uuid": user.get("friendCode", ""),
+        "uuid": friend_code,
+        "role": user.get("role", "user"),
+        "invitedBy": user.get("invitedBy"),
     }
 
 
@@ -156,3 +243,10 @@ async def get_user_internal_id(db: AsyncIOMotorDatabase, uid: str) -> str | None
     """Get the MongoDB ObjectId string for a Firebase UID user."""
     user = await db.users.find_one({"firebaseUid": uid}, {"_id": 1})
     return str(user["_id"]) if user else None
+
+
+async def get_invited_users(db: AsyncIOMotorDatabase, friend_code: str) -> list[dict]:
+    """Get all users invited by this friend code."""
+    cursor = db.users.find({"invitedBy": friend_code})
+    users = await cursor.to_list(length=100)
+    return [serialize_doc(u) for u in users]

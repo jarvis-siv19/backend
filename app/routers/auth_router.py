@@ -38,6 +38,7 @@ async def signup(
         email=current_user["email"] or request.email,
         name=request.name,
         password=request.password,
+        invite_code=request.inviteCode,
     )
     return user
 

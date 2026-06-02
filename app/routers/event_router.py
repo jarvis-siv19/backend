@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
+from app.models.schemas import EventCreate, EventUpdate
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
@@ -40,7 +41,7 @@ async def get_event(
 
 @router.post("/event")
 async def create_event(
-    request: Request,
+    request: EventCreate,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -49,9 +50,7 @@ async def create_event(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    request_data = await request.json()
-    if "id" in request_data:
-        del request_data["id"]
+    request_data = request.model_dump(by_alias=True)
 
     try:
         result = await event_service.save_event(db, user_id, request_data)
@@ -62,7 +61,7 @@ async def create_event(
 
 @router.put("/event")
 async def update_event(
-    request: Request,
+    request: EventUpdate,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -71,9 +70,7 @@ async def update_event(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    request_data = await request.json()
-    if "id" not in request_data:
-        raise HTTPException(status_code=400, detail="Event ID required")
+    request_data = request.model_dump(by_alias=True)
 
     try:
         result = await event_service.save_event(db, user_id, request_data)

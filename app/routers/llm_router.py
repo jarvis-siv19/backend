@@ -24,3 +24,13 @@ async def convert_expense(
 
     result = await llm_service.process_expense_from_text(db, sentence)
     return result
+
+@router.get("/active-model")
+async def get_active_model(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Get the currently active LLM model."""
+    settings = await db.settings.find_one({"_id": "llm_settings"})
+    active_model = settings.get("activeModel", "gemini-1.5-flash") if settings else "gemini-1.5-flash"
+    return {"activeModel": active_model}

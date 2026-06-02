@@ -1,21 +1,27 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
+
+# - PYTHONUNBUFFERED: stream logs straight to stdout (Cloud Run log capture)
+# - PYTHONDONTWRITEBYTECODE: no .pyc files in the image
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
+# Install dependencies first for better layer caching.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY . .
+# Copy only the application package (keeps the image small; no tests/.env).
+COPY app ./app
 
-# Expose port
-EXPOSE 8081
+# Run as a non-root user.
+RUN useradd --create-home --uid 1000 appuser
+USER appuser
 
-# Run the application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8081"]
+# Cloud Run (and most PaaS) inject $PORT; default to 8080 for plain `docker run`.
+ENV PORT=8080
+EXPOSE 8080
+
+# `exec` makes uvicorn PID 1 so it receives SIGTERM for graceful shutdown.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

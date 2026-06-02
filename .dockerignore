@@ -1,0 +1,27 @@
+# Keep the build context (and image) small.
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Never bake secrets / local config into the image.
+.env
+.env.*
+!.env.example
+
+# Dev-only / not needed at runtime.
+tests/
+test_api.py
+requirements-dev.txt
+docker-compose.yml
+.git/
+.gitignore
+.gcloudignore
+.dockerignore
+Dockerfile
+*.md
+.pytest_cache/
+.DS_Store
+deploy.sh

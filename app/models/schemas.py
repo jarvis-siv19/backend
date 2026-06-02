@@ -14,6 +14,7 @@ class SignupRequest(BaseModel):
     email: str
     name: str
     password: str = ""
+    inviteCode: str = ""
 
 
 class UserResponse(BaseModel):
@@ -22,6 +23,8 @@ class UserResponse(BaseModel):
     name: str
     friendCode: str
     upiId: str = ""
+    role: str = "user"
+    invitedBy: Optional[str] = None
 
 
 class ChangePasswordRequest(BaseModel):
@@ -40,6 +43,29 @@ class UpdateAccountRequest(BaseModel):
 class DashboardRequest(BaseModel):
     startDate: Optional[str] = None
     endDate: Optional[str] = None
+
+
+# ─── Issues ─────────────────────────────────────────────────────────────
+
+class IssueCreate(BaseModel):
+    type: str = "issue" # "issue" or "feature_request"
+    title: str
+    description: str
+
+class IssueResponse(BaseModel):
+    id: str
+    userId: str
+    type: str
+    title: str
+    description: str
+    status: str
+    createdAt: str
+
+
+# ─── Admin ──────────────────────────────────────────────────────────────
+
+class AdminModelUpdate(BaseModel):
+    activeModel: str
 
 
 # ─── Events ─────────────────────────────────────────────────────────────

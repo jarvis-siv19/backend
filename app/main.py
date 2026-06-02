@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.database import connect_to_mongo, close_mongo_connection
-from app.auth import initialize_firebase
+
 from app.routers import (
     auth_router,
     user_router,
@@ -14,6 +14,8 @@ from app.routers import (
     context_router,
     payment_router,
     llm_router,
+    admin_router,
+    issues_router,
 )
 
 
@@ -22,7 +24,6 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle events."""
     # Startup
     await connect_to_mongo()
-    initialize_firebase()
     print("SplitLLM Backend started")
     yield
     # Shutdown
@@ -41,6 +42,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,6 +85,12 @@ app.include_router(payment_router.router, prefix="/db", tags=["Payments"])
 
 # LLM routes: /llm/expense
 app.include_router(llm_router.router, prefix="/llm", tags=["LLM"])
+
+# Admin routes: /db/admin/*
+app.include_router(admin_router.router, prefix="/db/admin", tags=["Admin"])
+
+# Issues routes: /db/issues
+app.include_router(issues_router.router, prefix="/db/issues", tags=["Issues"])
 
 
 # ─── Health Check ───────────────────────────────────────────────────────

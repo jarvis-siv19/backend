@@ -9,15 +9,16 @@ class Settings(BaseSettings):
     MONGODB_URI: str = "mongodb://localhost:27017"
     DB_NAME: str = "splitllm"
 
-    # Firebase
-    FIREBASE_CREDENTIALS_PATH: str = ""
+    # Supabase (for asymmetric JWT validation)
+    SUPABASE_URL: str = "https://your-project.supabase.co"
+    SUPABASE_ANON_KEY: str = "your-anon-key"
 
     # Google Gemini LLM
     GEMINI_API_KEY: str = ""
     GEMINI_MODEL: str = "gemini-2.0-flash"
 
     # CORS
-    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8080,http://localhost:5000"
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8080,http://localhost:5000,http://localhost:8081,http://localhost:52345,http://localhost:52346,http://localhost:52347,http://localhost:52348,http://localhost:52349,http://localhost:52350"
 
     # Server
     HOST: str = "0.0.0.0"
