@@ -5,7 +5,11 @@ from .provider_base import BaseLLMProvider
 
 class GoogleGeminiProvider(BaseLLMProvider):
     def __init__(self):
-        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self.client = genai.Client(
+            vertexai=True,
+            project=settings.GCP_PROJECT_ID,
+            location=settings.GCP_LOCATION,
+        )
 
     async def generate_content(self, model_name: str, prompt: str) -> Tuple[str, Dict[str, Any]]:
         response = self.client.models.generate_content(

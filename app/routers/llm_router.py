@@ -16,7 +16,7 @@ async def convert_expense(
 ):
     """
     Use LLM to parse a natural language expense description.
-    Fetches the prompt from the database (with versioning) and sends to Gemini.
+    Fetches the prompt from the database (with versioning) and sends to Vertex AI (Gemini).
     """
     sentence = request.requestData.get("sentence", "")
     if not sentence:

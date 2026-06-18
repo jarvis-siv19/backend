@@ -13,8 +13,9 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = "https://your-project.supabase.co"
     SUPABASE_ANON_KEY: str = "your-anon-key"
 
-    # Google Gemini LLM
-    GEMINI_API_KEY: str = ""
+    # Google Vertex AI (Gemini)
+    GCP_PROJECT_ID: str = ""
+    GCP_LOCATION: str = "global"
     GEMINI_MODEL: str = "gemini-2.0-flash"
 
     # CORS

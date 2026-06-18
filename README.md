@@ -1,13 +1,13 @@
 # SplitLLM Backend
 
-Modern async FastAPI backend for the SplitLLM expense-splitting app with Supabase JWT authentication, MongoDB, and Google Gemini LLM integration.
+Async FastAPI backend for the SplitLLM expense-splitting app with Supabase JWT authentication, MongoDB, and Google Vertex AI (Gemini) for natural language expense parsing.
 
 ## Tech Stack
 
 - **Python 3.12+** with **FastAPI**
 - **Motor** (async MongoDB driver)
 - **Supabase JWT** verification (asymmetric, via the project's public JWKS)
-- **Google Gemini** (`google-genai`) for natural language expense parsing
+- **Google Vertex AI** (`google-genai` with Vertex AI backend) for LLM inference
 - **Pydantic v2** for request/response validation
 
 ## Quick Start
@@ -15,9 +15,10 @@ Modern async FastAPI backend for the SplitLLM expense-splitting app with Supabas
 ### 1. Prerequisites
 
 - Python 3.12+
-- MongoDB (local or Atlas)
+- MongoDB (local via Docker, or Atlas for production)
 - A Supabase project (for auth)
-- Google Gemini API key
+- A GCP project with Vertex AI API enabled
+- `gcloud` CLI for local auth (`gcloud auth application-default login`)
 
 ### 2. Setup
 
@@ -33,12 +34,16 @@ pip install -r requirements-dev.txt   # or `-r requirements.txt` for runtime onl
 
 # Configure environment
 cp .env.example .env
-# Edit .env with your credentials (MONGODB_URI, SUPABASE_*, GEMINI_API_KEY)
+# Edit .env with your credentials (MONGODB_URI, SUPABASE_*, GCP_PROJECT_ID, etc.)
 ```
 
-Auth is stateless: the API validates the Supabase access token (Bearer JWT) sent
-by the client against `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` and reads the
-user id from the `sub` claim. No service-account file is required.
+**Authentication:**
+- **Supabase:** Stateless JWT validation — the API verifies the Supabase access token
+  (Bearer JWT) against `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` and reads the
+  user id from the `sub` claim.
+- **Vertex AI:** Uses Application Default Credentials (ADC). Locally, run
+  `gcloud auth application-default login`. On Cloud Run, the service account provides
+  credentials automatically — just grant it the `roles/aiplatform.user` IAM role.
 
 ### 3. Run
 
@@ -50,42 +55,43 @@ uvicorn app.main:app --host 0.0.0.0 --port 8081 --reload
 uvicorn app.main:app --host 0.0.0.0 --port 8081 --workers 4
 ```
 
-### 4. Docker (local)
+### 4. Docker (local dev)
 
 ```bash
 docker-compose up -d   # starts the API + a local MongoDB
 ```
 
+The `docker-compose.yml` runs a local MongoDB 7.0 container with a named volume
+(`mongo_data`) for data persistence. Data survives `docker-compose down` but is
+only stored locally — use MongoDB Atlas for production.
+
 ## Deploy to Google Cloud Run
 
 The API ships as a container ([`Dockerfile`](./Dockerfile)) that listens on `$PORT`
-(Cloud Run injects `8080`). It scales to zero, so idle cost is \$0 — well within the
-free tier at ~1000 users.
+(Cloud Run injects `8080`). Connect your repository to Cloud Run for automatic
+deployment on every commit.
 
-**Database:** create a free **MongoDB Atlas M0** cluster, add a database user, and
+**Database:** Create a free **MongoDB Atlas M0** cluster, add a database user, and
 (for the M0 free tier) allow access from `0.0.0.0/0` (auth is via the connection
 string). Use the SRV connection string as `MONGODB_URI`.
 
-**One-time GCP setup** and deploy are scripted in [`deploy.sh`](./deploy.sh):
+**Vertex AI:** The Cloud Run service account needs the `roles/aiplatform.user` IAM
+role. No API key is required — authentication is handled via ADC.
 
-```bash
-# Enable APIs + create secrets (see the header of deploy.sh for the exact commands),
-# then:
-CORS_ORIGINS="https://your-app.vercel.app" ./deploy.sh
-```
+**Required Cloud Run Environment Variables:**
 
-What the script does:
-- builds the image from source (Cloud Build) and deploys to Cloud Run,
-- `--min-instances 0 --max-instances 4` (scale to zero),
-- `--allow-unauthenticated` — the browser frontend calls the API directly; endpoints
-  are protected by Supabase JWT validation,
-- secrets (`MONGODB_URI`, `GEMINI_API_KEY`) come from **Secret Manager**; the public
-  Supabase keys + `CORS_ORIGINS` are plain env vars.
+| Variable | Type | Description |
+|---|---|---|
+| `MONGODB_URI` | Secret | MongoDB Atlas SRV connection string |
+| `GCP_PROJECT_ID` | Env var | GCP project ID for Vertex AI |
+| `GCP_LOCATION` | Env var | Vertex AI region (e.g. `global`) |
+| `GEMINI_MODEL` | Env var | Model name (default: `gemini-2.0-flash`) |
+| `DB_NAME` | Env var | Database name (default: `splitllm`) |
+| `SUPABASE_URL` | Env var | Supabase project URL |
+| `SUPABASE_ANON_KEY` | Env var | Supabase publishable / anon key |
+| `CORS_ORIGINS` | Env var | Comma-separated allowed origins |
 
-After deploying, set the Flutter app's `API_BASE_URL` (Vercel env var) to the printed
-Cloud Run URL, and make sure that Vercel URL is in `CORS_ORIGINS`.
-
-> **Service-to-service:** another backend can call this API at its public URL. To make
+> **Service-to-service:** Another backend can call this API at its public URL. To make
 > a call privately/without exposing it, grant that service's account the
 > `roles/run.invoker` role and send a Google-signed ID token — Cloud Run handles the
 > IAM check. (Keep `--allow-unauthenticated` while the browser frontend needs direct
@@ -97,7 +103,7 @@ Once running, visit:
 - **Swagger UI**: http://localhost:8081/docs
 - **ReDoc**: http://localhost:8081/redoc
 
-## API Endpoints (22 total)
+## API Endpoints
 
 | Category | Method | Endpoint | Auth |
 |----------|--------|----------|------|
@@ -138,11 +144,12 @@ Once running, visit:
 | `DB_NAME` | Database name | `splitllm` |
 | `SUPABASE_URL` | Supabase project URL (used to fetch the JWKS) | `https://your-project.supabase.co` |
 | `SUPABASE_ANON_KEY` | Supabase publishable / anon key | (set per environment) |
-| `GEMINI_API_KEY` | Google Gemini API key (**secret**) | (required for LLM) |
+| `GCP_PROJECT_ID` | GCP project ID for Vertex AI | (required for LLM) |
+| `GCP_LOCATION` | Vertex AI region | `global` |
 | `GEMINI_MODEL` | Gemini model name | `gemini-2.0-flash` |
 | `CORS_ORIGINS` | Comma-separated allowed origins (add your Vercel URL) | `http://localhost:3000,...` |
 | `HOST` | Server host (local only) | `0.0.0.0` |
 | `PORT` | Server port (Cloud Run injects `8080`) | `8081` |
 
-> On Cloud Run, `MONGODB_URI` and `GEMINI_API_KEY` are provided via **Secret Manager**;
+> On Cloud Run, `MONGODB_URI` should be provided via **Secret Manager**;
 > the rest are plain env vars. Locally they all come from `.env`.

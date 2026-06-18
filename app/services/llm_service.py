@@ -102,7 +102,7 @@ async def process_expense_from_text(
 
     if error:
         return {
-            "message": f"Exception while calling Gemini API: {error}",
+            "message": f"Exception while calling LLM API: {error}",
             "llmoutput": {},
         }
 

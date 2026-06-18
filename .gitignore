@@ -30,3 +30,4 @@ service-account*.json
 
 # Uploads
 uploads/
+.aider*
