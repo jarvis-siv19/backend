@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from bson import ObjectId
+from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
 from app.services import fx_service
@@ -180,6 +181,17 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
     }
 
 
+async def is_event_member(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str
+) -> bool:
+    """True if the user belongs to the event. Guards event reads/writes."""
+    try:
+        event = await db.event.find_one({"_id": ObjectId(event_id)}, {"users": 1})
+        return bool(event) and ObjectId(user_id) in event.get("users", [])
+    except Exception:
+        return False
+
+
 async def get_event_by_id(db: AsyncIOMotorDatabase, event_id: str) -> dict | None:
     """Get single event with populated user details."""
     event = await db.event.find_one({"_id": ObjectId(event_id)})
@@ -218,8 +230,16 @@ async def save_event(
         if not event:
             raise ValueError("Event not found")
 
+        # Only members may edit an event.
+        if ObjectId(user_id) not in event.get("users", []):
+            raise HTTPException(
+                status_code=403, detail="You are not a member of this event"
+            )
+
         # Resolve users - could be ObjectId strings or email addresses
-        new_user_ids = await _resolve_users(db, request_data.get("users", []))
+        new_user_ids, invited = await _resolve_users(
+            db, request_data.get("users", [])
+        )
 
         original_set = set(str(u) for u in event.get("users", []))
         modified_set = set(str(u) for u in new_user_ids)
@@ -267,10 +287,13 @@ async def save_event(
             if str(uid) != user_id:
                 await _auto_add_friend(db, user_id, str(uid))
 
+        await _send_member_invites(db, user_id, invited)
         return await get_event_by_id(db, event_id)
     else:
         # Create new event
-        user_ids = await _resolve_users(db, request_data.get("users", []))
+        user_ids, invited = await _resolve_users(
+            db, request_data.get("users", [])
+        )
 
         # Ensure creator is in the list
         creator_oid = ObjectId(user_id)
@@ -304,25 +327,73 @@ async def save_event(
             if str(uid) != user_id:
                 await _auto_add_friend(db, user_id, str(uid))
 
+        await _send_member_invites(db, user_id, invited)
         new_event["_id"] = result.inserted_id
         return await get_event_by_id(db, str(result.inserted_id))
 
 
-async def _resolve_users(db: AsyncIOMotorDatabase, user_refs: list) -> list:
-    """Resolve a list of user references (ObjectId strings) to ObjectIds."""
-    user_ids = []
+async def _resolve_users(
+    db: AsyncIOMotorDatabase, user_refs: list
+) -> tuple[list, list]:
+    """Resolve user references to ObjectIds.
+
+    References may be ObjectId strings or email addresses. An email that isn't a
+    registered user creates a phantom account (find-or-create) so the person is
+    actually added to the event instead of being silently dropped; newly
+    created phantoms are returned so the caller can email them an invite.
+    Returns ``(user_ids, newly_invited_phantoms)``.
+    """
+    from app.services import user_service
+
+    user_ids: list = []
+    invited: list = []
     for ref in user_refs:
         if isinstance(ref, dict):
             ref = ref.get("id", ref.get("_id", ""))
-        ref = str(ref)
+        ref = str(ref).strip()
+        if not ref:
+            continue
         try:
-            user_ids.append(ObjectId(ref))
+            oid = ObjectId(ref)
+            if oid not in user_ids:
+                user_ids.append(oid)
+            continue
         except Exception:
-            # Try looking up by email
-            user = await db.users.find_one({"email": ref})
-            if user:
-                user_ids.append(user["_id"])
-    return user_ids
+            pass
+        # Not an ObjectId — treat as an email and find-or-create the user.
+        if "@" in ref:
+            phantom = await user_service.create_phantom_user(db, email=ref)
+            try:
+                oid = ObjectId(phantom["id"])
+            except Exception:
+                continue
+            if oid not in user_ids:
+                user_ids.append(oid)
+            if phantom.get("wasCreated"):
+                invited.append(phantom)
+    return user_ids, invited
+
+
+async def _send_member_invites(
+    db: AsyncIOMotorDatabase, inviter_id: str, invited: list
+) -> None:
+    """Email newly-created phantom members an invite to join."""
+    if not invited:
+        return
+    from app.services import email_service
+
+    inviter = await db.users.find_one({"_id": ObjectId(inviter_id)}, {"name": 1})
+    inviter_name = (inviter or {}).get("name", "")
+    for phantom in invited:
+        email = phantom.get("email")
+        if email:
+            email_service.send_in_background(
+                email_service.send_invite_email(
+                    to_email=email,
+                    to_name=phantom.get("name", ""),
+                    inviter_name=inviter_name,
+                )
+            )
 
 
 async def _auto_add_friend(db: AsyncIOMotorDatabase, user_id: str, friend_id: str):

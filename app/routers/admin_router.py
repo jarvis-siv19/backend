@@ -48,9 +48,15 @@ async def delete_user(
     admin_user: dict = Depends(get_admin_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Delete a user (Admin only)"""
-    result = await db.users.delete_one({"firebaseUid": uid})
-    if result.deleted_count == 0:
+    """Delete a user (Admin only)
+
+    Uses the same tombstone flow as self-service deletion so shared expenses
+    keep resolving (to "Deleted User") instead of leaving dangling references.
+    """
+    from app.services import user_service
+
+    deleted = await user_service.delete_user_account(db, uid)
+    if not deleted:
         raise HTTPException(status_code=404, detail="User not found")
     return {"message": "User deleted"}
 
@@ -70,11 +76,14 @@ async def reset_password(
         raise HTTPException(status_code=400, detail="User has no email")
         
     try:
-        # Use Supabase REST API to send reset email
+        # Use Supabase REST API to send reset email. The recover endpoint
+        # authenticates with the project's anon/publishable key.
+        if not settings.SUPABASE_ANON_KEY:
+            raise HTTPException(status_code=500, detail="Supabase key not configured")
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/recover",
-                headers={"apikey": settings.SUPABASE_KEY},
+                headers={"apikey": settings.SUPABASE_ANON_KEY},
                 json={"email": email}
             )
             response.raise_for_status()
@@ -88,8 +97,8 @@ async def list_prompts(
     admin_user: dict = Depends(get_admin_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """List all LLM prompt history (Admin only)"""
-    cursor = db.llm_history.find().sort("createdAt", -1).limit(200)
+    """List all LLM prompts (Admin only)"""
+    cursor = db.prompts.find().sort("version", -1).limit(200)
     history = await cursor.to_list(length=200)
     return [serialize_doc(h) for h in history]
 
@@ -132,17 +141,27 @@ async def get_models(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Get active model configuration and available models with stats (Admin only)"""
-    # Get active model
+    # Get active model. The provider is Catalyst QuickML, so default to the
+    # configured text model rather than a stale Gemini id.
     config = await db.settings.find_one({"_id": "llm_settings"})
-    active_model = config.get("activeModel", "gemini-1.5-flash") if config else "gemini-1.5-flash"
-    
-    # Available models list
+    active_model = (
+        config.get("activeModel", settings.CATALYST_LLM_MODEL)
+        if config
+        else settings.CATALYST_LLM_MODEL
+    )
+
+    # Available models list — the actual Catalyst-served models.
     available_models = [
-        {"id": "gemini-1.5-flash", "name": "Gemini 1.5 Flash", "provider": "Google"},
-        {"id": "gemini-1.5-pro", "name": "Gemini 1.5 Pro", "provider": "Google"},
-        {"id": "gemini-1.0-pro", "name": "Gemini 1.0 Pro", "provider": "Google"},
-        {"id": "gemma:2b", "name": "Gemma 2B", "provider": "Ollama (Local)"},
-        {"id": "llama3", "name": "Llama 3", "provider": "Ollama (Local)"}
+        {
+            "id": settings.CATALYST_LLM_MODEL,
+            "name": f"{settings.CATALYST_LLM_MODEL} (text)",
+            "provider": "Catalyst QuickML",
+        },
+        {
+            "id": settings.CATALYST_VLM_MODEL,
+            "name": f"{settings.CATALYST_VLM_MODEL} (vision)",
+            "provider": "Catalyst QuickML",
+        },
     ]
     
     # Fetch stats for models
@@ -174,3 +193,27 @@ async def set_active_model(
         upsert=True
     )
     return {"message": f"Active model set to {data.activeModel}"}
+
+
+@router.put("/app-version")
+async def set_app_version(
+    update_data: dict = Body(...),
+    admin_user: dict = Depends(get_admin_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Set the version info served by GET /version (Admin only).
+
+    Bumps the "update available" prompt without a redeploy. Accepts any of:
+    latest, latestBuild, minSupported, android{url}, ios{url}, notes.
+    """
+    from app.routers.version_router import _ALLOWED_FIELDS, get_version_info
+
+    filtered = {k: v for k, v in update_data.items() if k in _ALLOWED_FIELDS}
+    if not filtered:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+
+    filtered["updatedAt"] = datetime.now(timezone.utc)
+    await db.app_config.update_one(
+        {"_id": "app_version"}, {"$set": filtered}, upsert=True
+    )
+    return await get_version_info(db)

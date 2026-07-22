@@ -1,8 +1,10 @@
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
+from app.services import fx_service
 from app.services.user_service import serialize_doc
 
 
@@ -17,15 +19,33 @@ async def create_page(
 ) -> dict:
     """Create a payment page with UPI link."""
     upi_id = request_data.get("destination", "")
-    expiry = request_data.get("expiry", 24)
+    try:
+        expiry = int(request_data.get("expiry", 24))
+    except (TypeError, ValueError):
+        expiry = 24
     amount = request_data.get("amount", 0)
     note = request_data.get("note", "")
 
     now = datetime.now(timezone.utc)
     link = generate_link()
 
+    # The payee name and currency come from the requester's account, and every
+    # field is URL-encoded so notes/UPI ids with spaces or symbols don't break
+    # the link. The `upi://` scheme is required for a UPI app to open it.
+    payer = await db.users.find_one(
+        {"_id": ObjectId(user_id)}, {"name": 1, "defaultCurrency": 1}
+    )
+    payee_name = (payer or {}).get("name") or "SplitLLM User"
+    currency = fx_service.normalize_currency(
+        request_data.get("currency") or (payer or {}).get("defaultCurrency")
+    )
     upi_link = (
-        f"pay?pa={upi_id}&pn=User1&tn={note}&am={amount}&cu=INR"
+        "upi://pay?"
+        f"pa={quote(str(upi_id))}"
+        f"&pn={quote(payee_name)}"
+        f"&tn={quote(str(note))}"
+        f"&am={quote(str(amount))}"
+        f"&cu={currency}"
     )
 
     page = {
@@ -34,6 +54,7 @@ async def create_page(
         "upiLink": upi_link,
         "link": link,
         "amount": float(amount),
+        "currency": currency,
         "note": note,
         "createdAt": now,
         "expiryAt": now + timedelta(hours=expiry),
@@ -63,6 +84,7 @@ async def view_page(db: AsyncIOMotorDatabase, link: str) -> dict | None:
                 "upiId": 1,
                 "upiLink": 1,
                 "amount": 1,
+                "currency": 1,
                 "note": 1,
                 "expiryAt": 1,
                 "userName": {"$ifNull": ["$user.name", "Unknown"]},

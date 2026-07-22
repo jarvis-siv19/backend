@@ -8,6 +8,9 @@ from datetime import datetime
 class LoginRequest(BaseModel):
     email: str
     password: str = ""
+    # Carried through so a user whose signup call failed (e.g. email-confirmation
+    # delayed the session) is still created with their invite code on first login.
+    inviteCode: str = ""
 
 
 class SignupRequest(BaseModel):

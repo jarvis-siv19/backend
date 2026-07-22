@@ -65,6 +65,12 @@ async def get_active_model(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Get the currently active LLM model."""
-    settings = await db.settings.find_one({"_id": "llm_settings"})
-    active_model = settings.get("activeModel", "gemini-1.5-flash") if settings else "gemini-1.5-flash"
+    from app.config import settings as app_settings
+
+    config = await db.settings.find_one({"_id": "llm_settings"})
+    active_model = (
+        config.get("activeModel", app_settings.CATALYST_LLM_MODEL)
+        if config
+        else app_settings.CATALYST_LLM_MODEL
+    )
     return {"activeModel": active_model}

@@ -75,6 +75,19 @@ class Settings(BaseSettings):
     # Public URL of the web app (used in email links)
     APP_BASE_URL: str = "https://splitllm.com"
 
+    # ─── App version / update prompt ────────────────────────────────────
+    # Defaults for GET /version. A Mongo `app_config` doc (_id="app_version")
+    # overrides these at runtime so the version can be bumped without a
+    # redeploy (see the admin PUT /db/admin/app-version endpoint).
+    APP_LATEST_VERSION: str = "1.0.0"
+    APP_LATEST_BUILD: int = 1
+    # Clients older than this are forced to update (hard gate).
+    APP_MIN_SUPPORTED_VERSION: str = "0.0.0"
+    # Where each platform sends users to get the new build.
+    APP_ANDROID_URL: str = ""  # Play listing or hosted APK
+    APP_IOS_URL: str = ""  # App Store / TestFlight
+    APP_UPDATE_NOTES: str = ""
+
     # CORS
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:8080,http://localhost:5000,http://localhost:8081,http://localhost:52345,http://localhost:52346,http://localhost:52347,http://localhost:52348,http://localhost:52349,http://localhost:52350"
 

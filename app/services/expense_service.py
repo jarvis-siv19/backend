@@ -1,9 +1,37 @@
 from datetime import datetime, timezone
 from bson import ObjectId
+from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
 from app.services import fx_service
 from app.services.user_service import serialize_doc
+
+
+async def user_can_access_expense(
+    db: AsyncIOMotorDatabase, expense: dict, user_id: str
+) -> bool:
+    """True if the user created the expense, is a participant, or is a member
+    of the event it belongs to. Guards read/update/delete against IDOR."""
+    if str(expense.get("createdBy")) == user_id:
+        return True
+    participants = {
+        str(s.get("userId"))
+        for s in expense.get("shares", []) + expense.get("payShares", [])
+    }
+    if user_id in participants:
+        return True
+    event_ref = expense.get("eventId")
+    if event_ref:
+        try:
+            event = await db.event.find_one(
+                {"_id": event_ref if isinstance(event_ref, ObjectId) else ObjectId(event_ref)},
+                {"users": 1},
+            )
+        except Exception:
+            event = None
+        if event and ObjectId(user_id) in event.get("users", []):
+            return True
+    return False
 
 
 async def _resolve_base_currency(
@@ -33,6 +61,18 @@ async def create_expense(
     expense_type = request_data.get("type", "normal")
     shares = request_data.get("shares", [])
     pay_shares = request_data.get("payShares", [])
+
+    # A personal ("normal") expense is implicitly paid by — and owed by — its
+    # creator for the full amount. The split UI only sends shares/payShares for
+    # multi-person expenses, so without this a personal expense is stored with
+    # empty payShares and then never matches the personal-list / dashboard
+    # queries (which filter on payShares.userId), silently disappearing from
+    # the user's own history.
+    if expense_type == "normal":
+        if not pay_shares:
+            pay_shares = [{"userId": user_id, "amount": amount}]
+        if not shares:
+            shares = [{"userId": user_id, "amount": amount}]
 
     if expense_type != "normal" and (len(pay_shares) == 0 or len(shares) == 0):
         return {
@@ -139,6 +179,9 @@ async def get_expense_by_id(
     expense = await db.expense.find_one({"_id": ObjectId(expense_id)})
     if not expense:
         return None
+    # Hide expenses the caller isn't part of (return None -> router 404).
+    if not await user_can_access_expense(db, expense, user_id):
+        return None
 
     # Populate shares with user names. Amounts are surfaced in the transaction
     # currency (originalAmount) so edit forms round-trip what was entered.
@@ -196,6 +239,9 @@ async def get_expense_by_id(
         "baseCurrency": expense.get("baseCurrency", settings.DEFAULT_CURRENCY),
         "fxRate": float(expense.get("fxRate", 1.0)),
         "type": expense.get("type", ""),
+        "paidByName": ", ".join(ps["name"] for ps in new_pay_shares)
+        if new_pay_shares
+        else "Unknown",
         "payShares": new_pay_shares,
         "shares": new_shares,
         "createdAt": str(expense.get("createdAt", "")),
@@ -226,6 +272,10 @@ async def update_expense(
     expense = await db.expense.find_one({"_id": ObjectId(expense_id)})
     if not expense:
         return {"message": "Expense not found", "success": "false"}
+    if not await user_can_access_expense(db, expense, user_id):
+        raise HTTPException(
+            status_code=403, detail="You do not have access to this expense"
+        )
 
     # Re-resolve the FX conversion: the transaction currency may have changed,
     # while the base (context) currency stays with the event/creator.
@@ -301,11 +351,17 @@ async def update_expense(
     return {"message": "Successfully updated expense", "success": "true"}
 
 
-async def delete_expense(db: AsyncIOMotorDatabase, expense_id: str) -> dict:
+async def delete_expense(
+    db: AsyncIOMotorDatabase, expense_id: str, user_id: str
+) -> dict:
     """Delete an expense and remove from its event if applicable."""
     expense = await db.expense.find_one({"_id": ObjectId(expense_id)})
     if not expense:
         return {"message": "Expense not found", "success": "false"}
+    if not await user_can_access_expense(db, expense, user_id):
+        raise HTTPException(
+            status_code=403, detail="You do not have access to this expense"
+        )
 
     # Remove from event if linked
     if expense.get("eventId"):
@@ -403,15 +459,15 @@ async def get_all_expenses_for_user(
     }
 
     # Apply filters
-    operator_map = {"IN": "$in"}
     for f in filters:
         field = f.get("field", "")
         operator = f.get("operator", "")
         values = f.get("values", [])
 
         if operator == "IN":
-            lowercase_values = [v.lower() for v in values]
-            query[field] = {"$in": lowercase_values}
+            # Match stored values as-is; categories are stored capitalized
+            # (e.g. "General"), so lowercasing here matched nothing.
+            query[field] = {"$in": values}
         elif operator == "BTW":
             if values[0] != "MIN":
                 query.setdefault(field, {})

@@ -119,7 +119,11 @@ async def delete_expense(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Delete an expense."""
-    result = await expense_service.delete_expense(db, expense_id)
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    result = await expense_service.delete_expense(db, expense_id, user_id)
     return result
 
 

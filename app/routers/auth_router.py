@@ -24,6 +24,7 @@ async def login(
         email=identity["email"] or request.email,
         name=identity.get("name", ""),
         password=request.password,
+        invite_code=request.inviteCode,
     )
     return user
 

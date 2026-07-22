@@ -33,6 +33,10 @@ async def get_event(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Get single event details."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
     event = await event_service.get_event_by_id(db, event_id)
     if not event:
         raise HTTPException(status_code=404, detail="Event not found")
@@ -86,6 +90,10 @@ async def delete_event(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Delete an event and its associated expenses."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
     result = await event_service.delete_event(db, event_id)
     return result
 
@@ -98,8 +106,8 @@ async def get_event_expenses(
 ):
     """List all expenses for an event."""
     user_id = await user_service.get_user_internal_id(db, current_user["uid"])
-    if not user_id:
-        raise HTTPException(status_code=404, detail="User not found")
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
 
     result = await expense_service.get_event_expenses_with_summary(
         db, user_id, event_id
@@ -115,8 +123,8 @@ async def get_event_dues_for_user(
 ):
     """Calculate who owes whom within an event for the current user."""
     user_id = await user_service.get_user_internal_id(db, current_user["uid"])
-    if not user_id:
-        raise HTTPException(status_code=404, detail="User not found")
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
 
     result = await event_service.get_event_dues_for_user(db, event_id, user_id)
     return result
@@ -129,5 +137,9 @@ async def get_event_dues(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Calculate all dues within an event."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
     result = await event_service.get_event_dues(db, event_id)
     return result

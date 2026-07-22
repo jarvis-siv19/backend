@@ -18,6 +18,7 @@ from app.routers import (
     issues_router,
     fx_router,
     import_router,
+    version_router,
 )
 
 
@@ -99,6 +100,9 @@ app.include_router(fx_router.router, prefix="/db", tags=["FX"])
 
 # Import routes: /db/import/splitwise, /db/import/splitwise/preview
 app.include_router(import_router.router, prefix="/db/import", tags=["Import"])
+
+# Version route: /version (public; drives the in-app update prompt)
+app.include_router(version_router.router, tags=["Version"])
 
 
 # ─── Health Check ───────────────────────────────────────────────────────

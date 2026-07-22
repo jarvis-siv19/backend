@@ -116,6 +116,9 @@ async def get_friend_list(db: AsyncIOMotorDatabase, user_id: str) -> dict:
                 "id": fid,
                 "name": user_map[fid].get("name", ""),
                 "email": user_map[fid].get("email", ""),
+                # Needed so the list can unfriend by code (delete_friend keys on
+                # friendCode); without it removal silently fails.
+                "friendCode": user_map[fid].get("friendCode", ""),
                 "oweAmount": abs(amount),
                 "whoOwes": "friend" if amount > 0 else "user",
             }

@@ -32,7 +32,10 @@ async def get_verified_identity(
         decoded_token = jwt.decode(
             token,
             signing_key.key,
-            algorithms=["RS256", "ES256", "HS256"],
+            # Pin to the asymmetric algorithms Supabase's JWKS issues. Allowing
+            # HS256 alongside a JWKS public key invites an algorithm-confusion
+            # attack (a token HMAC-signed with the public key).
+            algorithms=["RS256", "ES256"],
             audience="authenticated"
         )
 
