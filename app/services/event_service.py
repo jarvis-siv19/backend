@@ -238,7 +238,10 @@ async def save_event(
 
         # Resolve users - could be ObjectId strings or email addresses
         new_user_ids, invited = await _resolve_users(
-            db, request_data.get("users", [])
+            db,
+            request_data.get("users", []),
+            actor_id=user_id,
+            extra_allowed={str(u) for u in event.get("users", [])},
         )
 
         original_set = set(str(u) for u in event.get("users", []))
@@ -292,7 +295,7 @@ async def save_event(
     else:
         # Create new event
         user_ids, invited = await _resolve_users(
-            db, request_data.get("users", [])
+            db, request_data.get("users", []), actor_id=user_id
         )
 
         # Ensure creator is in the list
@@ -332,8 +335,28 @@ async def save_event(
         return await get_event_by_id(db, str(result.inserted_id))
 
 
+async def _is_phantom(db: AsyncIOMotorDatabase, oid: ObjectId) -> bool:
+    """True if the id belongs to a placeholder account nobody has claimed.
+
+    Phantoms represent people who have not registered, so adding one to an
+    event cannot expose a real user's data — the Splitwise import creates them
+    and then passes their ids straight into event creation.
+    """
+    user = await db.users.find_one(
+        {"_id": oid}, {"isPhantom": 1, "firebaseUid": 1}
+    )
+    if not user:
+        return False
+    return bool(user.get("isPhantom")) or str(
+        user.get("firebaseUid", "")
+    ).startswith("phantom_")
+
+
 async def _resolve_users(
-    db: AsyncIOMotorDatabase, user_refs: list
+    db: AsyncIOMotorDatabase,
+    user_refs: list,
+    actor_id: str,
+    extra_allowed: set[str] | None = None,
 ) -> tuple[list, list]:
     """Resolve user references to ObjectIds.
 
@@ -342,11 +365,27 @@ async def _resolve_users(
     actually added to the event instead of being silently dropped; newly
     created phantoms are returned so the caller can email them an invite.
     Returns ``(user_ids, newly_invited_phantoms)``.
+
+    ``actor_id`` bounds who may be added: the actor's existing friends, plus
+    people who are not registered yet (a fresh phantom the actor is inviting),
+    plus ``extra_allowed`` (on edit, the event's current members — they may
+    have been added by a different member and need not be the actor's friends).
+    An existing registered stranger is rejected — otherwise any authenticated
+    user could pull an arbitrary victim into an event they control, which
+    exposes the victim's email and (via _auto_add_friend) writes an unconsented
+    friendship into the victim's own document.
     """
     from app.services import user_service
 
+    actor_oid = ObjectId(actor_id)
+    actor = await db.users.find_one({"_id": actor_oid}, {"friends": 1})
+    allowed = {str(f) for f in (actor or {}).get("friends", [])}
+    allowed.add(str(actor_oid))
+    allowed |= extra_allowed or set()
+
     user_ids: list = []
     invited: list = []
+    rejected: list = []
     for ref in user_refs:
         if isinstance(ref, dict):
             ref = ref.get("id", ref.get("_id", ""))
@@ -355,6 +394,9 @@ async def _resolve_users(
             continue
         try:
             oid = ObjectId(ref)
+            if str(oid) not in allowed and not await _is_phantom(db, oid):
+                rejected.append(ref)
+                continue
             if oid not in user_ids:
                 user_ids.append(oid)
             continue
@@ -367,10 +409,25 @@ async def _resolve_users(
                 oid = ObjectId(phantom["id"])
             except Exception:
                 continue
+            # A pre-existing *registered* account reached by email is only
+            # allowed if the actor is already connected to them.
+            if (
+                not phantom.get("wasCreated")
+                and str(oid) not in allowed
+                and not await _is_phantom(db, oid)
+            ):
+                rejected.append(ref)
+                continue
             if oid not in user_ids:
                 user_ids.append(oid)
             if phantom.get("wasCreated"):
                 invited.append(phantom)
+
+    if rejected:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only add your friends or invite new people by email.",
+        )
     return user_ids, invited
 
 

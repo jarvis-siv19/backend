@@ -25,6 +25,16 @@ async def create_payment(
 
     friend_id = request_data.get("friendId")
     if friend_id and page.get("link"):
+        # Only mail a payment request to an actual friend. Otherwise anyone
+        # could have the app send a stranger a branded, DKIM-signed request
+        # for an arbitrary amount payable to an attacker-chosen UPI address.
+        requester = await db.users.find_one(
+            {"_id": ObjectId(user_id)}, {"friends": 1}
+        )
+        if ObjectId(friend_id) not in (requester or {}).get("friends", []):
+            raise HTTPException(
+                status_code=403, detail="You can only request payment from a friend."
+            )
         friend = await db.users.find_one(
             {"_id": ObjectId(friend_id)}, {"email": 1, "name": 1}
         )

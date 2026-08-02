@@ -5,9 +5,15 @@ from datetime import datetime
 
 # ─── Auth ───────────────────────────────────────────────────────────────
 
+# NB: these models deliberately have no `password` field. Clients still send
+# one; pydantic ignores unknown keys, and the backend stores no password —
+# Supabase is the sole authenticator.
+
 class LoginRequest(BaseModel):
-    email: str
-    password: str = ""
+    # Optional: the handler prefers the email on the verified JWT. Clients that
+    # register after an OAuth/email-confirmation redirect have a session but no
+    # form fields to send, and a required email made those calls 422.
+    email: str = ""
     # Carried through so a user whose signup call failed (e.g. email-confirmation
     # delayed the session) is still created with their invite code on first login.
     inviteCode: str = ""
@@ -16,7 +22,6 @@ class LoginRequest(BaseModel):
 class SignupRequest(BaseModel):
     email: str
     name: str
-    password: str = ""
     inviteCode: str = ""
 
 
@@ -31,7 +36,7 @@ class UserResponse(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
-    password: str
+    password: str = ""
 
 
 # ─── Account ────────────────────────────────────────────────────────────

@@ -98,10 +98,12 @@ async def test_delete_account_tombstones_user_and_removes_personal_data(client):
         assert tombstone["name"] == "Deleted User"
         assert tombstone["email"] == ""
         assert tombstone["upiId"] == ""
-        assert tombstone["password"] == ""
         assert tombstone["isDeleted"] is True
         assert tombstone["firebaseUid"].startswith("deleted_")
         assert "friendCode" not in tombstone
+        # The backend stores no password at all now; deletion also clears any
+        # legacy hash left on the document.
+        assert "password" not in tombstone
         friend_doc = await db.users.find_one({"_id": friend.inserted_id})
         assert friend_doc["friends"] == []
 

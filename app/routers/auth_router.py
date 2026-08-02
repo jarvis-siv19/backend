@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user, get_verified_identity
 from app.database import get_db
@@ -13,17 +13,24 @@ router = APIRouter()
 # code from the request body — rejecting every new (non-first) user.
 @router.post("/login")
 async def login(
-    request: LoginRequest,
     identity: dict = Depends(get_verified_identity),
     db: AsyncIOMotorDatabase = Depends(get_db),
+    request: LoginRequest = Body(default_factory=LoginRequest),
 ):
-    """Called after Firebase sign-in. Creates user if not exists."""
+    """Called after Firebase sign-in. Creates user if not exists.
+
+    The body is optional: clients registering after an OAuth or
+    email-confirmation redirect have a verified session but nothing to send.
+    """
     user = await user_service.find_or_create_user(
         db,
         uid=identity["uid"],
-        email=identity["email"] or request.email,
+        # Identity comes from the verified JWT only. Falling back to the
+        # client-supplied email let a caller whose token carried no email
+        # claim name an arbitrary victim, and find_or_create_user would then
+        # rebind that account to the caller's uid.
+        email=identity["email"],
         name=identity.get("name", ""),
-        password=request.password,
         invite_code=request.inviteCode,
     )
     return user
@@ -39,9 +46,12 @@ async def signup(
     user = await user_service.find_or_create_user(
         db,
         uid=identity["uid"],
-        email=identity["email"] or request.email,
+        # Identity comes from the verified JWT only. Falling back to the
+        # client-supplied email let a caller whose token carried no email
+        # claim name an arbitrary victim, and find_or_create_user would then
+        # rebind that account to the caller's uid.
+        email=identity["email"],
         name=request.name,
-        password=request.password,
         invite_code=request.inviteCode,
     )
     return user
@@ -60,5 +70,5 @@ async def change_password(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Update password in backend (Firebase password change is client-side)."""
-    result = await user_service.change_password(db, current_user["uid"], request.password)
+    result = await user_service.change_password(db, current_user["uid"])
     return result

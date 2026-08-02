@@ -318,6 +318,12 @@ async def settle_up_friend_dues(
     if not friend or not user:
         return {"success": "false", "message": "Invalid request"}
 
+    # Existence is not a relationship. get_friend_details already gates its read
+    # on this; without the same check here a caller could write settle records
+    # against — and email — someone they have no connection to.
+    if ObjectId(friend_id) not in user.get("friends", []):
+        return {"success": "false", "message": "Invalid request"}
+
     now = datetime.now(timezone.utc)
 
     # 1. Settle for group events

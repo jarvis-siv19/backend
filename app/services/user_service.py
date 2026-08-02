@@ -1,26 +1,31 @@
-import random
+import secrets
 import string
 from datetime import datetime, timezone
 from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from argon2 import PasswordHasher
 from fastapi import HTTPException
 
 from app.config import settings
 
-ph = PasswordHasher()
-
 
 def generate_friend_code(length: int = 8) -> str:
-    """Generate a unique alphanumeric friend code."""
+    """Generate a unique alphanumeric friend code.
+
+    Uses `secrets`, not `random`: this code is both the registration invite
+    code and the add-friend key, matching payment_service.generate_link.
+    """
     num_digits = 2
     num_letters = length - num_digits
-    digits = "".join(random.choice(string.digits) for _ in range(num_digits))
+    digits = "".join(secrets.choice(string.digits) for _ in range(num_digits))
     letters = "".join(
-        random.choice(string.ascii_uppercase) for _ in range(num_letters)
+        secrets.choice(string.ascii_uppercase) for _ in range(num_letters)
     )
     code_list = list(digits + letters)
-    random.shuffle(code_list)
+    # Fisher-Yates over secrets.randbelow; random.shuffle would reintroduce
+    # the Mersenne Twister this function just avoided.
+    for i in range(len(code_list) - 1, 0, -1):
+        j = secrets.randbelow(i + 1)
+        code_list[i], code_list[j] = code_list[j], code_list[i]
     return "".join(code_list)
 
 
@@ -36,12 +41,31 @@ def _serialize_value(value):
     return value
 
 
+#: Never leaves the service layer. ``password`` is a legacy argon2 hash of the
+#: user's real Supabase credential; it is no longer written (see
+#: find_or_create_user) but still exists on documents created before that
+#: change, so strip it defensively rather than trusting the migration.
+_PRIVATE_USER_FIELDS = frozenset({"password"})
+
+#: The only user fields safe to hand to *another* user. Anything describing a
+#: capability (friendCode, which is both the invite code and the add-friend
+#: key) or another user's relationships stays out.
+_PUBLIC_USER_FIELDS = frozenset({"id", "name", "email"})
+
+
 def serialize_doc(doc: dict) -> dict:
-    """Convert MongoDB document to JSON-serializable dict (recursively)."""
+    """Convert MongoDB document to JSON-serializable dict (recursively).
+
+    Strips credential fields so that a user document can never leak them, even
+    when a caller forgets to project. Use :func:`public_user` when returning
+    someone *other* than the caller.
+    """
     if doc is None:
         return None
     result = {}
     for key, value in doc.items():
+        if key in _PRIVATE_USER_FIELDS:
+            continue
         if key == "_id":
             result["id"] = str(value)
         else:
@@ -49,16 +73,43 @@ def serialize_doc(doc: dict) -> dict:
     return result
 
 
+def public_user(doc: dict) -> dict:
+    """Serialize a user document for disclosure to a *different* user."""
+    if doc is None:
+        return None
+    serialized = serialize_doc(doc)
+    return {k: v for k, v in serialized.items() if k in _PUBLIC_USER_FIELDS}
+
+
 async def find_or_create_user(
-    db: AsyncIOMotorDatabase, uid: str, email: str, name: str = "", password: str = "", invite_code: str = ""
+    db: AsyncIOMotorDatabase, uid: str, email: str, name: str = "", invite_code: str = ""
 ) -> dict:
     """Find user by Firebase UID, or create one if not exists."""
     user = await db.users.find_one({"firebaseUid": uid})
     if user:
         return serialize_doc(user)
 
-    # Also check by email for backward compatibility
-    user = await db.users.find_one({"email": email})
+    if not email:
+        raise HTTPException(
+            status_code=400, detail="Authenticated token carries no email address."
+        )
+
+    # Claim an existing account by email — legacy records and phantom users
+    # created before this person signed up. Restricted to accounts that are not
+    # already bound to a real Supabase identity: without that guard, anyone who
+    # could present a token for `email` would take over the live account.
+    user = await db.users.find_one(
+        {
+            "email": email,
+            "$or": [
+                {"firebaseUid": {"$exists": False}},
+                {"firebaseUid": None},
+                {"firebaseUid": ""},
+                {"firebaseUid": {"$regex": "^phantom_"}},
+                {"isPhantom": True},
+            ],
+        }
+    )
     if user:
         # Ensure legacy users get a friend code
         if not user.get("friendCode"):
@@ -99,10 +150,9 @@ async def find_or_create_user(
 
     friend_code = generate_friend_code(8)
 
-    password_hash = ""
-    if password:
-        password_hash = ph.hash(password)
-
+    # No password is stored. Supabase is the sole authenticator — nothing in
+    # this backend ever verified the hash we used to keep here, so it was a
+    # shadow copy of the user's real credential with no function.
     new_user_data = {
         "firebaseUid": uid,
         "email": email,
@@ -111,7 +161,6 @@ async def find_or_create_user(
         "upiId": "",
         "defaultCurrency": settings.DEFAULT_CURRENCY,
         "friends": [],
-        "password": password_hash,
         "role": role,
         "invitedBy": invited_by,
         "createdAt": now,
@@ -169,7 +218,11 @@ async def create_phantom_user(
     email = email.strip().lower()
     existing = await db.users.find_one({"email": email})
     if existing:
-        result = serialize_doc(existing)
+        # This is a lookup of someone else's account by email, so return only
+        # what the caller needs to attach a share. Returning the raw document
+        # here handed any authenticated user an arbitrary victim's friendCode
+        # (the invite/add-friend key) and legacy password hash.
+        result = public_user(existing)
         result["wasCreated"] = False
         return result
 
@@ -186,7 +239,6 @@ async def create_phantom_user(
         "upiId": "",
         "defaultCurrency": settings.DEFAULT_CURRENCY,
         "friends": [],
-        "password": "",
         "role": "user",
         "isPhantom": True,
         "invitedBy": None,
@@ -195,7 +247,9 @@ async def create_phantom_user(
     }
     result = await db.users.insert_one(doc)
     doc["_id"] = result.inserted_id
-    serialized = serialize_doc(doc)
+    # Same shape as the existing-user branch above; callers only need the id
+    # and enough to address an invite email.
+    serialized = public_user(doc)
     serialized["wasCreated"] = True
     return serialized
 
@@ -291,13 +345,19 @@ async def update_user_account(
 
 
 async def change_password(
-    db: AsyncIOMotorDatabase, uid: str, password: str
-) -> dict:
-    """Update stored password hash."""
-    password_hash = ph.hash(password)
+    db: AsyncIOMotorDatabase, uid: str, password: str = "") -> dict:
+    """Acknowledge a password change.
+
+    The password itself lives only in Supabase, which the client updates
+    directly; this backend stores no copy. Kept as an endpoint so existing
+    clients keep working, and it clears any legacy hash left on the document.
+    """
     await db.users.update_one(
         {"firebaseUid": uid},
-        {"$set": {"password": password_hash, "updatedAt": datetime.now(timezone.utc)}},
+        {
+            "$set": {"updatedAt": datetime.now(timezone.utc)},
+            "$unset": {"password": ""},
+        },
     )
     return {"message": "Password updated successfully"}
 
@@ -310,7 +370,10 @@ async def get_user_internal_id(db: AsyncIOMotorDatabase, uid: str) -> str | None
 
 async def get_invited_users(db: AsyncIOMotorDatabase, friend_code: str) -> list[dict]:
     """Get all users invited by this friend code."""
-    cursor = db.users.find({"invitedBy": friend_code})
+    cursor = db.users.find(
+        {"invitedBy": friend_code},
+        {"_id": 1, "name": 1, "email": 1, "createdAt": 1},
+    )
     users = await cursor.to_list(length=100)
     return [serialize_doc(u) for u in users]
 
@@ -377,14 +440,13 @@ async def delete_user_account(db: AsyncIOMotorDatabase, uid: str) -> bool:
                 "email": "",
                 "name": "Deleted User",
                 "upiId": "",
-                "password": "",
                 "friends": [],
                 "role": "user",
                 "isDeleted": True,
                 "deletedAt": now,
                 "updatedAt": now,
             },
-            "$unset": {"friendCode": ""},
+            "$unset": {"friendCode": "", "password": ""},
         },
     )
 

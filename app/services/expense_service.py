@@ -34,6 +34,56 @@ async def user_can_access_expense(
     return False
 
 
+#: Columns a client may filter the personal-expense list on. Used as Mongo
+#: query keys, so this allowlist is a security control, not ergonomics.
+_FILTERABLE_FIELDS = frozenset(
+    {"category", "amount", "originalAmount", "date", "currency", "baseCurrency"}
+)
+
+
+def _is_scalar(value) -> bool:
+    """Reject nested objects/arrays, which could smuggle query operators."""
+    return isinstance(value, (str, int, float, bool)) or value is None
+
+
+async def _assert_participants_allowed(
+    db: AsyncIOMotorDatabase,
+    user_id: str,
+    event: dict | None,
+    shares: list,
+    pay_shares: list,
+) -> None:
+    """Reject expenses naming users the creator has no relationship with.
+
+    Every id in shares/payShares must be the creator, a member of the event the
+    expense belongs to, or one of the creator's friends. Unchecked, any
+    authenticated user could invent a debt for a stranger — which also mails
+    them an attacker-controlled expense name via the notification hook.
+    """
+    named: set[str] = set()
+    for entry in list(shares) + list(pay_shares):
+        raw = entry.get("userId")
+        if raw:
+            named.add(str(raw))
+    named.discard(str(user_id))
+    if not named:
+        return
+
+    if event is not None:
+        allowed = {str(u) for u in event.get("users", [])}
+    else:
+        creator = await db.users.find_one({"_id": ObjectId(user_id)}, {"friends": 1})
+        allowed = {str(f) for f in (creator or {}).get("friends", [])}
+    allowed.add(str(user_id))
+
+    unknown = named - allowed
+    if unknown:
+        raise HTTPException(
+            status_code=403,
+            detail="Expense includes users you are not connected to.",
+        )
+
+
 async def _resolve_base_currency(
     db: AsyncIOMotorDatabase, user_id: str, event: dict | None
 ) -> str:
@@ -102,6 +152,16 @@ async def create_expense(
         event = await db.event.find_one({"_id": ObjectId(event_id)})
         if not event:
             raise ValueError("Event not found for the provided eventId")
+        # Existing != permitted. Without this, a non-member could push a
+        # fabricated expense into any group whose id they knew.
+        if ObjectId(user_id) not in event.get("users", []):
+            raise HTTPException(
+                status_code=403, detail="You are not a member of this event"
+            )
+
+    await _assert_participants_allowed(
+        db, user_id, event, shares, pay_shares
+    )
 
     base_currency = await _resolve_base_currency(db, user_id, event)
     currency = fx_service.normalize_currency(
@@ -291,6 +351,16 @@ async def update_expense(
         request_data.get("currency") or expense.get("currency") or base_currency
     )
 
+    # Same rule as creation: an edit must not introduce participants the
+    # editor has no relationship with.
+    await _assert_participants_allowed(
+        db,
+        user_id,
+        event,
+        request_data.get("shares", []),
+        request_data.get("payShares", []),
+    )
+
     date_val = expense.get("date")
     if "date" in request_data and request_data["date"]:
         date_val = request_data["date"]
@@ -453,28 +523,45 @@ async def get_all_expenses_for_user(
     user_object_id = ObjectId(user_id)
     filters = request_data.get("filters", [])
 
-    query = {
-        "type": "normal",
-        "payShares": {"$elemMatch": {"userId": user_object_id}},
-    }
-
-    # Apply filters
+    # `field` is used as a Mongo query key, so it must be allowlisted: a filter
+    # naming `type` or `payShares` would otherwise overwrite the ownership
+    # predicate below and return other users' expenses.
+    filter_clause: dict = {}
     for f in filters:
         field = f.get("field", "")
         operator = f.get("operator", "")
         values = f.get("values", [])
 
+        if field not in _FILTERABLE_FIELDS:
+            continue
+
         if operator == "IN":
             # Match stored values as-is; categories are stored capitalized
             # (e.g. "General"), so lowercasing here matched nothing.
-            query[field] = {"$in": values}
+            if isinstance(values, list):
+                filter_clause[field] = {"$in": [v for v in values if _is_scalar(v)]}
         elif operator == "BTW":
-            if values[0] != "MIN":
-                query.setdefault(field, {})
-                query[field]["$gte"] = float(values[0])
-            if len(values) > 1 and values[1] != "MAX":
-                query.setdefault(field, {})
-                query[field]["$lte"] = float(values[1])
+            try:
+                if values[0] != "MIN":
+                    filter_clause.setdefault(field, {})
+                    filter_clause[field]["$gte"] = float(values[0])
+                if len(values) > 1 and values[1] != "MAX":
+                    filter_clause.setdefault(field, {})
+                    filter_clause[field]["$lte"] = float(values[1])
+            except (TypeError, ValueError, IndexError):
+                filter_clause.pop(field, None)
+
+    # Ownership predicate goes in its own $and branch so no filter can replace it.
+    query: dict = {
+        "$and": [
+            {
+                "type": "normal",
+                "payShares": {"$elemMatch": {"userId": user_object_id}},
+            }
+        ]
+    }
+    if filter_clause:
+        query["$and"].append(filter_clause)
 
     expenses = (
         await db.expense.find(query)

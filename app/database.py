@@ -25,6 +25,15 @@ async def _seed_database(db: AsyncIOMotorDatabase):
     await db.users.create_index([("firebaseUid", pymongo.ASCENDING)], unique=True, sparse=True)
     await db.users.create_index([("friendCode", pymongo.ASCENDING)], unique=True, sparse=True)
 
+    # Drop the legacy `password` field. Supabase is the sole authenticator and
+    # nothing here ever verified this hash, so it was a shadow copy of the
+    # user's real credential. Idempotent: a no-op once every document is clean.
+    purged = await db.users.update_many(
+        {"password": {"$exists": True}}, {"$unset": {"password": ""}}
+    )
+    if purged.modified_count:
+        print(f"Purged legacy password hash from {purged.modified_count} user(s)")
+
 async def connect_to_mongo():
     """Initialize MongoDB connection on app startup.
 
