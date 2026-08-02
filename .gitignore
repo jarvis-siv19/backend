@@ -32,6 +32,9 @@ service-account*.json
 uploads/
 .aider*
 
+# IBM Code Engine (real secret values; secrets.example.env is committed)
+ibm/secrets.env*
+
 # Catalyst
 catalyst/appsail/build/
 catalyst/.catalystrc

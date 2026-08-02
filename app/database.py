@@ -1,3 +1,5 @@
+import asyncio
+
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
 from app.config import settings
 
@@ -47,6 +49,34 @@ async def connect_to_mongo():
             f"WARNING: MongoDB not reachable at startup ({e}); "
             "continuing without a verified connection"
         )
+
+
+async def ping_database(timeout_s: float = 5.0) -> tuple[bool, str | None]:
+    """Check whether Mongo is currently reachable.
+
+    Returns (ok, reason). Never raises — a dead database is a reportable state,
+    not a crash.
+
+    `timeout_s` caps how long the caller blocks. It matters: the driver's own
+    serverSelectionTimeoutMS is 5s, and a /health that blocks that long would
+    exceed the liveness probe's timeout and get the container killed for a
+    failure a restart cannot fix. Liveness callers pass a short timeout.
+
+    The reason is a short, non-sensitive summary — the full driver error names
+    the Mongo host and port, and these endpoints are public and unauthenticated,
+    so the detail goes to the log instead.
+    """
+    if _client is None:
+        return False, "not initialized"
+    try:
+        await asyncio.wait_for(_client.admin.command("ping"), timeout=timeout_s)
+        return True, None
+    except asyncio.TimeoutError:
+        print(f"WARNING: database ping exceeded {timeout_s}s")
+        return False, "timeout"
+    except Exception as e:
+        print(f"WARNING: database ping failed: {e}")
+        return False, type(e).__name__
 
 
 async def close_mongo_connection():

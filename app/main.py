@@ -1,8 +1,8 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.database import connect_to_mongo, close_mongo_connection
+from app.database import connect_to_mongo, close_mongo_connection, ping_database
 
 from app.routers import (
     auth_router,
@@ -113,4 +113,37 @@ async def root():
 
 @app.get("/health", tags=["Health"])
 async def health_check():
-    return {"status": "healthy"}
+    """Liveness: is this process alive?
+
+    Always 200 while the process can serve, and reports database state in the
+    body for observability. It deliberately does NOT fail on an unreachable
+    database: the liveness probe restarts the container on failure, and
+    restarting an app cannot fix a Mongo outage — it would only turn a
+    dependency failure into a cluster-wide restart loop. Use /ready to gate
+    traffic on the database.
+    """
+    # Short timeout: this response must land well inside the liveness probe's
+    # timeout even when Mongo is hanging, or the probe kills the container.
+    db_ok, db_reason = await ping_database(timeout_s=1.0)
+    body = {
+        "status": "healthy",
+        "database": "connected" if db_ok else "unreachable",
+    }
+    if db_reason:
+        body["databaseReason"] = db_reason
+    return body
+
+
+@app.get("/ready", tags=["Health"])
+async def readiness_check(response: Response):
+    """Readiness: can this instance actually serve requests?
+
+    503 when Mongo is unreachable, which takes the instance out of the load
+    balancer without killing it — it rejoins on its own once the database is
+    back. This is what the Code Engine readiness probe targets.
+    """
+    db_ok, db_reason = await ping_database(timeout_s=3.0)
+    if not db_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "not ready", "database": "unreachable", "databaseReason": db_reason}
+    return {"status": "ready", "database": "connected"}

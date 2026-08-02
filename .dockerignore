@@ -10,6 +10,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+ibm/secrets.env
 
 # Dev-only / not needed at runtime.
 tests/
@@ -20,7 +21,6 @@ docker-compose.yml
 .gitignore
 .gcloudignore
 .dockerignore
-Dockerfile
 *.md
 .pytest_cache/
 .DS_Store
