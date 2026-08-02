@@ -1,9 +1,18 @@
-name: CI/CD
+name: CI
 
 on:
   pull_request:
   push:
     branches: [main]
+
+# Deployment is NOT automated. Production runs on IBM Cloud Code Engine and is
+# deployed by running ./ibm/deploy.sh from a machine with `ibmcloud login`.
+#
+# This workflow used to deploy to Zoho Catalyst AppSail on every push to main.
+# Production moved to Code Engine, but the job stayed — so it kept reporting
+# success while deploying to a host that serves 404, which made a green CI look
+# like the backend had shipped when it had not. Removed rather than left
+# misleading. See README "Deployment".
 
 jobs:
   test:
@@ -21,26 +30,3 @@ jobs:
           cache: pip
       - run: pip install -r requirements-dev.txt
       - run: pytest
-
-  deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: test
-    runs-on: ubuntu-latest
-    concurrency: catalyst-deploy
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-      - name: Build AppSail bundle (vendored deps for manylinux/cp312)
-        run: sh catalyst/scripts/build_appsail.sh
-      - name: Deploy to Catalyst
-        working-directory: catalyst
-        run: |
-          npm install -g zcatalyst-cli
-          catalyst --token "$CATALYST_TOKEN" --project SplitLLM --org 60078340202 --dc in deploy --ignore-scripts
-        env:
-          CATALYST_TOKEN: ${{ secrets.CATALYST_TOKEN }}

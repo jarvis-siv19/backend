@@ -69,7 +69,7 @@ only stored locally — use MongoDB Atlas for production.
 database user, and (for the M0 free tier) allow access from `0.0.0.0/0` (auth is
 via the connection string). Use the SRV connection string as `MONGODB_URI`.
 
-> The production deploy path is **Zoho Catalyst AppSail** — see the section below.
+> The production deploy path is **IBM Cloud Code Engine** — see the section below.
 
 ## API Documentation
 
@@ -130,10 +130,40 @@ Once running, visit:
 > and the Catalyst console (secrets never enter the bundle or repo). Locally they
 > all come from `.env`. See `.env.example` for the full list.
 
-## Deployment (Zoho Catalyst AppSail)
+## Deployment (IBM Cloud Code Engine)
 
-The API runs as an AppSail service in the Catalyst project **SplitLLM**
-(`46831000000013050`, org `60078340202`, IN DC). Config lives in `catalyst/`:
+Production runs on **IBM Cloud Code Engine** (Chennai, `in-che`) at
+`https://splitllm-api.2d1ubdljxfui.in-che.codeengine.appdomain.cloud` — this is
+the URL the Flutter client is built against (`API_BASE_URL` repo variable).
+
+### Deploy
+
+```bash
+ibmcloud login                 # one-time, plus `ibmcloud plugin install code-engine`
+./ibm/deploy.sh                # credit sizing: always warm, no cold starts
+./ibm/deploy.sh --free         # free-tier sizing: scales to zero
+```
+
+Idempotent — creates the project/secret/app on first run and updates them after.
+Code Engine builds the image from `Dockerfile` using a local-source build, so it
+deploys your working tree, not the pushed commit. Push first, then deploy.
+
+Env values come from `ibm/secrets.env` (gitignored; see `ibm/secrets.example.env`)
+and are synced into the `splitllm-env` Code Engine secret on every run.
+
+Verify: `/health` returns `{"status":"healthy","database":"connected"}` and
+`/ready` returns 200 (503 while Mongo is unreachable — readiness gates slow
+startup without killing the instance).
+
+> **Deployment is not automated.** `.github/workflows/deploy.yml` runs tests
+> only. A green CI does **not** mean the backend shipped — run `./ibm/deploy.sh`.
+
+## Legacy: Zoho Catalyst AppSail (no longer used)
+
+The API previously ran as an AppSail service in the Catalyst project **SplitLLM**
+(`46831000000013050`, org `60078340202`, IN DC). That deployment is dead — the
+AppSail URL now returns 404 — and CI no longer deploys to it. The `catalyst/`
+directory is kept only for reference:
 
 ```
 catalyst/
@@ -146,20 +176,7 @@ catalyst/
     └── build_appsail.sh   # app/ + vendored deps -> appsail/build
 ```
 
-### Deploy
-
-```bash
-cd catalyst
-catalyst project:use SplitLLM --org 60078340202   # one-time binding
-catalyst deploy                                   # predeploy runs build_appsail.sh
-```
-
-The AppSail URL is `https://splitllm-api-50044020391.development.catalystappsail.in`
-(`/health` should return ok). CI deploys automatically on push to `main`
-(see `.github/workflows/deploy.yml`; needs the `CATALYST_TOKEN` repo secret
-from `catalyst token:generate`).
-
-### Platform gotchas (hard-won — do not re-learn)
+### Platform gotchas (Catalyst — kept for reference)
 
 - **Env var names must not start with `ZOHO_` or `CATALYST_`** — AppSail
   rejects them with a 400 "reserved keywords" error. `app/config.py` maps the
