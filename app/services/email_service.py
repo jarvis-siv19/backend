@@ -149,27 +149,107 @@ async def send_settleup_email(
     to_email: str,
     to_name: str,
     payer_name: str,
+    payee_name: str = "",
     amount: float | None = None,
     currency: str | None = None,
+    is_payer: bool = False,
 ) -> bool:
+    """Confirmation that a settle-up is done. Sent to both sides.
+
+    The wording flips with the recipient — the same event is "you paid" to one
+    person and "you were paid" to the other, and a receipt that describes the
+    wrong direction is worse than none.
+    """
     payer = html.escape(payer_name or "Your friend")
+    payee = html.escape(payee_name or "your friend")
     name = html.escape(to_name or "there")
     amount_html = (
         f"<p style='font-size:17px;'><b>{_symbol(currency or '')}{amount:,.2f}</b></p>"
         if amount
         else ""
     )
+    if is_payer:
+        line = f"<p>Your settle-up with <b>{payee}</b> is confirmed.</p>"
+        subject = f"You settled up with {payee_name or 'your friend'}"
+    else:
+        line = f"<p><b>{payer}</b> settled up with you on SplitLLM.</p>"
+        subject = f"{payer_name or 'Your friend'} settled up with you"
     body = (
         f"<p>Hi {name},</p>"
-        f"<p><b>{payer}</b> settled up with you on SplitLLM.</p>"
+        f"{line}"
         f"{amount_html}"
-        "<p>Open the app to review the settlement.</p>"
+        "<p>Your balance is now clear. Open the app to review it.</p>"
     )
     return await _send(
         to_email,
         to_name,
-        f"{payer_name or 'Your friend'} settled up with you",
+        subject,
         _render("Settled up", body, "View settlement", settings.APP_BASE_URL),
+    )
+
+
+async def send_settle_confirm_request_email(
+    to_email: str,
+    to_name: str,
+    payer_name: str,
+    amount: float,
+    currency: str,
+) -> bool:
+    """Ask the person who is owed to confirm they actually received the money.
+
+    Nothing has been recorded yet at this point — the balance only moves once
+    they confirm, which is why this mail asks rather than informs.
+    """
+    payer = html.escape(payer_name or "Your friend")
+    name = html.escape(to_name or "there")
+    body = (
+        f"<p>Hi {name},</p>"
+        f"<p><b>{payer}</b> says they paid you "
+        f"<b>{_symbol(currency)}{amount:,.2f}</b> to settle up.</p>"
+        "<p>Confirm it in the app once you've received it — your balance stays "
+        "as it is until you do.</p>"
+    )
+    return await _send(
+        to_email,
+        to_name,
+        f"{payer_name or 'Your friend'} says they settled up — confirm it",
+        _render(
+            "Confirm a settle-up", body, "Review and confirm", settings.APP_BASE_URL
+        ),
+    )
+
+
+async def send_card_reminder_email(
+    to_email: str,
+    to_name: str,
+    card_name: str,
+    due_date: str,
+    days_until: int,
+    amount: float | None = None,
+    currency: str | None = None,
+) -> bool:
+    """Credit-card bill reminder, sent 10 and 5 days ahead of the due date."""
+    name = html.escape(to_name or "there")
+    card = html.escape(card_name or "your credit card")
+    amount_html = (
+        f"<p style='font-size:17px;'><b>{_symbol(currency or '')}{amount:,.2f}</b></p>"
+        if amount
+        else ""
+    )
+    when = "in 1 day" if days_until == 1 else f"in {days_until} days"
+    body = (
+        f"<p>Hi {name},</p>"
+        f"<p>Your <b>{card}</b> bill is due {when}, on <b>{html.escape(due_date)}</b>.</p>"
+        f"{amount_html}"
+        "<p>This is a reminder from SplitLLM — we don't have access to your "
+        "card or its balance, so check your issuer's statement for the exact "
+        "amount.</p>"
+    )
+    return await _send(
+        to_email,
+        to_name,
+        f"{card_name or 'Credit card'} bill due {when} ({due_date})",
+        _render("Card bill due soon", body, "Open SplitLLM", settings.APP_BASE_URL),
     )
 
 

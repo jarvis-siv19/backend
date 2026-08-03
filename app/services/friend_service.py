@@ -11,13 +11,24 @@ async def _viewer_currency(db: AsyncIOMotorDatabase, user_id: str) -> str:
 
 
 async def _base_to_viewer_rates(
-    db: AsyncIOMotorDatabase, expenses: list, viewer_currency: str
+    db: AsyncIOMotorDatabase, user_id: str, expenses: list, viewer_currency: str
 ) -> dict[str, float]:
-    """Current rates from each expense's base currency to the viewer currency."""
+    """Rates from each expense's base currency to the viewer currency.
+
+    Friend balances span groups in different currencies plus one-to-one
+    expenses that carry no group at all, so the viewer's own rate table is the
+    only thing that can reconcile them. Without it these sums silently fell
+    back to 1.0 and added dollars to rupees.
+    """
     bases = {
         fx_service.normalize_currency(e.get("baseCurrency")) for e in expenses
     }
-    return await fx_service.get_rates_to(viewer_currency, bases, db=db)
+    return await fx_service.get_rates_to(
+        viewer_currency,
+        bases,
+        db=db,
+        tables=[await fx_service.user_rate_table(db, user_id)],
+    )
 
 
 def _expense_rate(expense: dict, rates: dict[str, float]) -> float:
@@ -69,7 +80,7 @@ async def get_friend_list(db: AsyncIOMotorDatabase, user_id: str) -> dict:
     # Balances span events with different currencies, so each expense is
     # converted from its base currency to the viewer's currency at current rates.
     viewer_ccy = await _viewer_currency(db, user_id)
-    rates = await _base_to_viewer_rates(db, expenses, viewer_ccy)
+    rates = await _base_to_viewer_rates(db, user_id, expenses, viewer_ccy)
 
     # Compute dues
     friend_dues = defaultdict(float)
@@ -164,7 +175,7 @@ async def get_friend_details(
     total_user_owe = 0
 
     viewer_ccy = await _viewer_currency(db, user_id)
-    rates = await _base_to_viewer_rates(db, expenses, viewer_ccy)
+    rates = await _base_to_viewer_rates(db, user_id, expenses, viewer_ccy)
 
     for expense in expenses:
         user_owe = 0
@@ -256,15 +267,21 @@ async def get_friend_dues(
     if not friend or not user:
         return {"name": "", "id": "", "oweAmount": 0, "whoOwes": "user"}
 
+    # Only expenses one of these two actually paid for can create a debt
+    # between them; the unfiltered scan this replaced walked every expense in
+    # the database on each call.
     expenses = await db.expense.find(
-        {"type": {"$in": ["group", "friend", "settle"]}}
+        {
+            "type": {"$in": ["group", "friend", "settle"]},
+            "payShares.userId": {"$in": [ObjectId(user_id), ObjectId(friend_id)]},
+        }
     ).to_list(length=None)
 
     total_friend_owe = 0
     total_user_owe = 0
 
     viewer_ccy = await _viewer_currency(db, user_id)
-    rates = await _base_to_viewer_rates(db, expenses, viewer_ccy)
+    rates = await _base_to_viewer_rates(db, user_id, expenses, viewer_ccy)
 
     for expense in expenses:
         user_owe = 0
@@ -308,10 +325,142 @@ async def get_friend_dues(
     }
 
 
+async def _event_net_owed(
+    db: AsyncIOMotorDatabase, event: dict, payer_id: str, payee_id: str
+) -> float:
+    """How much ``payer_id`` owes ``payee_id`` inside one event, in its currency.
+
+    The proportional-split arithmetic lives in one place — ``gross_debts`` —
+    because it is the formula the balances screen also renders. Two copies of
+    it would let the amount you are asked to settle disagree with the amount
+    the app says you owe.
+    """
+    from app.services import event_service
+
+    expense_ids = [
+        e if isinstance(e, ObjectId) else ObjectId(e)
+        for e in event.get("expenses", [])
+    ]
+    expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
+        length=None
+    )
+
+    debts = event_service.gross_debts(expenses)
+    return debts.get(payer_id, {}).get(payee_id, 0.0) - debts.get(payee_id, {}).get(
+        payer_id, 0.0
+    )
+
+
+async def _execute_settlement(
+    db: AsyncIOMotorDatabase, actor_id: str, payer_id: str, payee_id: str
+) -> list[str]:
+    """Write the settle records that clear ``payer_id``'s debt to ``payee_id``.
+
+    One record per shared group (each in that group's own currency, so the
+    group's balances zero out exactly) plus one for everything outside any
+    group. Returns the created expense ids so an undo can remove precisely
+    these and nothing else.
+    """
+    payer = await db.users.find_one({"_id": ObjectId(payer_id)}, {"name": 1})
+    payee = await db.users.find_one({"_id": ObjectId(payee_id)}, {"name": 1})
+    payer_name = (payer or {}).get("name", "")
+    payee_name = (payee or {}).get("name", "")
+    now = datetime.now(timezone.utc)
+    created: list[str] = []
+
+    async def _write(
+        amount: float, event_id: str | None, label: str, currency: str | None = None
+    ) -> None:
+        result = await expense_service.create_expense(
+            db,
+            actor_id,
+            {
+                "expenseName": label,
+                "amount": amount,
+                "payShares": [{"userId": payer_id, "amount": amount}],
+                "shares": [{"userId": payee_id, "amount": amount}],
+                "type": "settle",
+                "category": "settle",
+                "date": now,
+                **({"eventId": event_id} if event_id else {}),
+                # The amount is already in the currency it was computed in, so
+                # state that currency explicitly and pin the rate. The actor
+                # may not be the payer (a creditor can settle on their behalf),
+                # and their default currency would otherwise be assumed.
+                **({"currency": currency} if currency else {}),
+                "fxRate": 1.0,
+            },
+        )
+        if result.get("success") == "true" and result.get("data", {}).get("id"):
+            created.append(result["data"]["id"])
+
+    events = await db.event.find(
+        {"users": {"$all": [ObjectId(payer_id), ObjectId(payee_id)]}}
+    ).to_list(length=None)
+    for event in events:
+        net_amount = await _event_net_owed(db, event, payer_id, payee_id)
+        if net_amount > 0.01:
+            await _write(
+                round(net_amount, 2),
+                str(event["_id"]),
+                f"{payer_name} settled up with {payee_name} ({event.get('eventName', '')})",
+            )
+
+    # Whatever is left is one-to-one, outside any group.
+    remaining = await get_friend_dues(db, payer_id, payee_id)
+    if remaining["whoOwes"] == "user" and remaining["oweAmount"] > 0.01:
+        await _write(
+            remaining["oweAmount"],
+            None,
+            f"{payer_name} settled up with {payee_name}",
+            currency=remaining.get("currency"),
+        )
+
+    return created
+
+
+async def _notify_settled(
+    db: AsyncIOMotorDatabase, payer_id: str, payee_id: str, amount: float, currency: str
+) -> None:
+    """Tell both sides it is done — only ever called once the money is recorded."""
+    from app.services import email_service
+
+    people = await db.users.find(
+        {"_id": {"$in": [ObjectId(payer_id), ObjectId(payee_id)]}},
+        {"email": 1, "name": 1},
+    ).to_list(length=None)
+    by_id = {str(p["_id"]): p for p in people}
+    payer = by_id.get(str(payer_id), {})
+    payee = by_id.get(str(payee_id), {})
+
+    for person, is_payer in ((payer, True), (payee, False)):
+        if not person.get("email"):
+            continue
+        email_service.send_in_background(
+            email_service.send_settleup_email(
+                to_email=person["email"],
+                to_name=person.get("name", ""),
+                payer_name=payer.get("name", ""),
+                payee_name=payee.get("name", ""),
+                amount=amount or None,
+                currency=currency,
+                is_payer=is_payer,
+            )
+        )
+
+
 async def settle_up_friend_dues(
     db: AsyncIOMotorDatabase, user_id: str, friend_id: str
 ) -> dict:
-    """Settle all outstanding dues with a friend."""
+    """Start a settle-up, which needs confirmation only when the payer asks.
+
+    Whoever *owes* the money can only claim to have paid it; the person who is
+    owed has to say they received it, so their click confirms rather than
+    initiates. When the creditor is the one settling there is nobody left to
+    confirm — they are the only person who could dispute it — so it completes
+    immediately. Emails go out once the settlement is actually recorded, never
+    when it is merely requested-and-pending.
+    """
     friend = await db.users.find_one({"_id": ObjectId(friend_id)})
     user = await db.users.find_one({"_id": ObjectId(user_id)})
 
@@ -324,79 +473,212 @@ async def settle_up_friend_dues(
     if ObjectId(friend_id) not in user.get("friends", []):
         return {"success": "false", "message": "Invalid request"}
 
-    now = datetime.now(timezone.utc)
+    dues = await get_friend_dues(db, user_id, friend_id)
+    amount = float(dues.get("oweAmount") or 0)
+    currency = dues.get("currency", "")
+    if amount <= 0.01:
+        return {"success": "false", "message": "Nothing to settle up."}
 
-    # 1. Settle for group events
-    events = await db.event.find(
-        {"users": {"$all": [ObjectId(user_id), ObjectId(friend_id)]}}
-    ).to_list(length=None)
+    caller_owes = dues.get("whoOwes") == "user"
+    payer_id, payee_id = (
+        (user_id, friend_id) if caller_owes else (friend_id, user_id)
+    )
 
-    for event in events:
-        net_amount = 0
-        expense_ids = [
-            e if isinstance(e, ObjectId) else ObjectId(e)
-            for e in event.get("expenses", [])
-        ]
-        expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
-            length=None
-        )
-
-        for expense in expenses:
-            payers = [str(ps["userId"]) for ps in expense.get("payShares", [])]
-            if user_id in payers or friend_id in payers:
-                total_paid = sum(
-                    float(ps["amount"]) for ps in expense.get("payShares", [])
-                )
-                if total_paid == 0:
-                    continue
-
-                for share in expense.get("shares", []):
-                    proportion = 0
-                    for ps in expense.get("payShares", []):
-                        ps_user = str(ps["userId"])
-                        share_user = str(share["userId"])
-                        ps_amount = float(ps["amount"])
-                        share_amount = float(share["amount"])
-
-                        if ps_user == user_id and share_user == friend_id:
-                            proportion -= share_amount * (ps_amount / total_paid)
-                        elif ps_user == friend_id and share_user == user_id:
-                            proportion += share_amount * (ps_amount / total_paid)
-
-                    net_amount += proportion
-
-        if net_amount > 0:
-            request_data = {
-                "expenseName": f"{user.get('name', '')} settled up with {friend.get('name', '')} ({event.get('eventName', '')})",
-                "amount": net_amount,
-                "payShares": [{"userId": user_id, "amount": net_amount}],
-                "type": "settle",
-                "eventId": str(event["_id"]),
-                "category": "settle",
-                "shares": [{"userId": friend_id, "amount": net_amount}],
-                "date": now,
-            }
-            await expense_service.create_expense(db, user_id, request_data)
-
-    # 2. Settle remaining dues (non-group)
-    friend_dues_result = await get_friend_dues(db, user_id, friend_id)
-    if (
-        friend_dues_result["whoOwes"] == "user"
-        and friend_dues_result["oweAmount"] != 0
-    ):
-        net_amount = friend_dues_result["oweAmount"]
-        request_data = {
-            "expenseName": f"{user.get('name', '')} settled up with {friend.get('name', '')}",
-            "amount": net_amount,
-            "payShares": [{"userId": user_id, "amount": net_amount}],
-            "type": "settle",
-            "category": "settle",
-            "shares": [{"userId": friend_id, "amount": net_amount}],
-            "date": now,
+    existing = await db.settlement_request.find_one(
+        {
+            "payerId": ObjectId(payer_id),
+            "payeeId": ObjectId(payee_id),
+            "status": "pending",
         }
-        await expense_service.create_expense(db, user_id, request_data)
+    )
+    if existing:
+        return {
+            "success": "false",
+            "status": "pending",
+            "settlementId": str(existing["_id"]),
+            "message": "A settle-up is already waiting to be confirmed.",
+        }
 
-    return {"success": "true", "message": "Settled successfully!"}
+    now = datetime.now(timezone.utc)
+    request_doc = {
+        "payerId": ObjectId(payer_id),
+        "payeeId": ObjectId(payee_id),
+        "requestedBy": ObjectId(user_id),
+        "amount": round(amount, 2),
+        "currency": currency,
+        "status": "pending",
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = await db.settlement_request.insert_one(request_doc)
+    settlement_id = result.inserted_id
+
+    if caller_owes:
+        from app.services import email_service
+
+        if friend.get("email"):
+            email_service.send_in_background(
+                email_service.send_settle_confirm_request_email(
+                    to_email=friend["email"],
+                    to_name=friend.get("name", ""),
+                    payer_name=user.get("name", ""),
+                    amount=amount,
+                    currency=currency,
+                )
+            )
+        return {
+            "success": "true",
+            "status": "pending",
+            "settlementId": str(settlement_id),
+            "message": f"Waiting for {friend.get('name', 'your friend')} to confirm they received it.",
+        }
+
+    return await _finalize_settlement(db, user_id, settlement_id)
+
+
+async def _finalize_settlement(
+    db: AsyncIOMotorDatabase, actor_id: str, settlement_id: ObjectId
+) -> dict:
+    """Record the settle expenses, log it, and mail both sides."""
+    from app.services import audit_service
+
+    # Claim it atomically so a double-tap cannot settle the same debt twice.
+    settlement = await db.settlement_request.find_one_and_update(
+        {"_id": settlement_id, "status": "pending"},
+        {
+            "$set": {
+                "status": "confirmed",
+                "confirmedBy": ObjectId(actor_id),
+                "confirmedAt": datetime.now(timezone.utc),
+                "updatedAt": datetime.now(timezone.utc),
+            }
+        },
+    )
+    if settlement is None:
+        return {"success": "false", "message": "This settle-up is no longer pending."}
+
+    payer_id = str(settlement["payerId"])
+    payee_id = str(settlement["payeeId"])
+    expense_ids = await _execute_settlement(db, actor_id, payer_id, payee_id)
+
+    await db.settlement_request.update_one(
+        {"_id": settlement_id}, {"$set": {"expenseIds": expense_ids}}
+    )
+
+    await audit_service.record(
+        db,
+        entity="settlement",
+        entity_id=settlement_id,
+        action="settle",
+        actor_id=actor_id,
+        audience=[payer_id, payee_id],
+        summary=f"a settle-up of {settlement.get('currency', '')} {settlement.get('amount', 0):,.2f}",
+        after={"expenseIds": expense_ids},
+    )
+
+    await _notify_settled(
+        db,
+        payer_id,
+        payee_id,
+        float(settlement.get("amount") or 0),
+        settlement.get("currency", ""),
+    )
+
+    return {
+        "success": "true",
+        "status": "settled",
+        "settlementId": str(settlement_id),
+        "message": "Settled successfully!",
+    }
+
+
+async def get_pending_settlements(
+    db: AsyncIOMotorDatabase, user_id: str
+) -> list[dict]:
+    """Open settle-ups involving the caller, flagged with who has to act."""
+    oid = ObjectId(user_id)
+    rows = (
+        await db.settlement_request.find(
+            {"status": "pending", "$or": [{"payerId": oid}, {"payeeId": oid}]}
+        )
+        .sort("createdAt", -1)
+        .to_list(length=100)
+    )
+
+    people_ids = {r["payerId"] for r in rows} | {r["payeeId"] for r in rows}
+    people = await db.users.find(
+        {"_id": {"$in": list(people_ids)}}, {"name": 1}
+    ).to_list(length=None)
+    names = {str(p["_id"]): p.get("name", "Someone") for p in people}
+
+    return [
+        {
+            "id": str(r["_id"]),
+            "payerId": str(r["payerId"]),
+            "payerName": names.get(str(r["payerId"]), "Someone"),
+            "payeeId": str(r["payeeId"]),
+            "payeeName": names.get(str(r["payeeId"]), "Someone"),
+            "amount": float(r.get("amount") or 0),
+            "currency": r.get("currency", ""),
+            # Only the person owed the money can confirm they received it.
+            "awaitingYou": str(r["payeeId"]) == str(user_id),
+            "createdAt": r["createdAt"].isoformat()
+            if isinstance(r.get("createdAt"), datetime)
+            else str(r.get("createdAt", "")),
+        }
+        for r in rows
+    ]
+
+
+async def confirm_settlement(
+    db: AsyncIOMotorDatabase, user_id: str, settlement_id: str
+) -> dict:
+    """Confirm receipt of a payment a friend said they made."""
+    try:
+        oid = ObjectId(settlement_id)
+    except Exception:
+        return {"success": "false", "message": "Settle-up not found."}
+
+    settlement = await db.settlement_request.find_one({"_id": oid})
+    if not settlement or str(settlement["payeeId"]) != str(user_id):
+        # Only the payee confirms; anyone else gets the same answer as a
+        # nonexistent id so this cannot be used to probe others' settle-ups.
+        return {"success": "false", "message": "Settle-up not found."}
+    if settlement.get("status") != "pending":
+        return {"success": "false", "message": "This settle-up is no longer pending."}
+
+    return await _finalize_settlement(db, user_id, oid)
+
+
+async def reject_settlement(
+    db: AsyncIOMotorDatabase, user_id: str, settlement_id: str
+) -> dict:
+    """Decline a claimed payment, or withdraw one you claimed yourself."""
+    try:
+        oid = ObjectId(settlement_id)
+    except Exception:
+        return {"success": "false", "message": "Settle-up not found."}
+
+    settlement = await db.settlement_request.find_one({"_id": oid})
+    if not settlement or str(user_id) not in (
+        str(settlement["payeeId"]),
+        str(settlement["payerId"]),
+    ):
+        return {"success": "false", "message": "Settle-up not found."}
+
+    updated = await db.settlement_request.find_one_and_update(
+        {"_id": oid, "status": "pending"},
+        {
+            "$set": {
+                "status": "rejected",
+                "rejectedBy": ObjectId(user_id),
+                "updatedAt": datetime.now(timezone.utc),
+            }
+        },
+    )
+    if updated is None:
+        return {"success": "false", "message": "This settle-up is no longer pending."}
+    return {"success": "true", "message": "Settle-up declined."}
 
 
 async def add_friend(

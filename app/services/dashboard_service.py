@@ -42,6 +42,7 @@ async def group_owe_details(
     db: AsyncIOMotorDatabase, user_id: str, viewer_currency: str
 ) -> tuple:
     """Calculate total owed and owing amounts for group/friend/settle expenses."""
+    viewer_rates = await fx_service.user_rate_table(db, user_id)
     pipeline = [
         {
             "$match": {
@@ -55,7 +56,9 @@ async def group_owe_details(
     result = await db.expense.aggregate(pipeline).to_list(length=None)
 
     bases = {fx_service.normalize_currency(e.get("baseCurrency")) for e in result}
-    rates = await fx_service.get_rates_to(viewer_currency, bases, db=db)
+    rates = await fx_service.get_rates_to(
+        viewer_currency, bases, db=db, tables=[viewer_rates]
+    )
 
     total_owed_amount = 0  # others owe me
     total_owe_amount = 0  # I owe others
@@ -106,6 +109,7 @@ async def get_summary_for_homepage(
     total_share = 0
 
     viewer_currency = fx_service.normalize_currency(user.get("defaultCurrency"))
+    viewer_rates = (user.get("fxRates"), viewer_currency)
 
     # Aggregate personal expenses where user paid, per base currency, then
     # convert each bucket into the viewer's currency.
@@ -130,7 +134,7 @@ async def get_summary_for_homepage(
     result = await db.expense.aggregate(personal_pipeline).to_list(length=None)
     personal_bases = {fx_service.normalize_currency(r["_id"]) for r in result}
     personal_rates = await fx_service.get_rates_to(
-        viewer_currency, personal_bases, db=db
+        viewer_currency, personal_bases, db=db, tables=[viewer_rates]
     )
     personal_expenses = sum(
         float(r["totalAmount"])
@@ -152,7 +156,9 @@ async def get_summary_for_homepage(
 
     result = await db.expense.aggregate(other_pipeline).to_list(length=None)
     other_bases = {fx_service.normalize_currency(e.get("baseCurrency")) for e in result}
-    other_rates = await fx_service.get_rates_to(viewer_currency, other_bases, db=db)
+    other_rates = await fx_service.get_rates_to(
+        viewer_currency, other_bases, db=db, tables=[viewer_rates]
+    )
     for expense in result:
         rate = other_rates.get(
             fx_service.normalize_currency(expense.get("baseCurrency")), 1.0
@@ -182,11 +188,12 @@ async def get_dashboard_chart(
     date_range = get_datetime_range(request_data)
 
     user = await db.users.find_one(
-        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1}
+        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1, "fxRates": 1}
     )
     viewer_currency = fx_service.normalize_currency(
         (user or {}).get("defaultCurrency")
     )
+    viewer_rates = ((user or {}).get("fxRates"), viewer_currency)
 
     # Group per (category, base currency); currency conversion and percentage
     # math happen in Python since rates live outside Mongo.
@@ -213,7 +220,9 @@ async def get_dashboard_chart(
 
     rows = await db.expense.aggregate(pipeline).to_list(length=None)
     bases = {fx_service.normalize_currency(r["_id"]["base"]) for r in rows}
-    rates = await fx_service.get_rates_to(viewer_currency, bases, db=db)
+    rates = await fx_service.get_rates_to(
+        viewer_currency, bases, db=db, tables=[viewer_rates]
+    )
 
     by_category: dict[str, dict] = {}
     total_cost = 0.0

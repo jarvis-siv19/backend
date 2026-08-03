@@ -3,7 +3,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
-from app.services import fx_service
+from app.services import audit_service, fx_service
 from app.services.user_service import serialize_doc, get_user_name_by_id
 
 
@@ -29,8 +29,10 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
             }
         },
         {
+            # Collection is `users` (plural). Looking up "user" always matched
+            # nothing, so every member resolved to "Unknown" in the event list.
             "$lookup": {
-                "from": "user",
+                "from": "users",
                 "let": {"userIds": "$users"},
                 "pipeline": [
                     {"$match": {"$expr": {"$in": ["$_id", "$$userIds"]}}},
@@ -73,7 +75,7 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
     # Overall totals are shown in the viewer's default currency; per-event dues
     # stay in the event's own currency.
     viewer = await db.users.find_one(
-        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1}
+        {"_id": ObjectId(user_id)}, {"defaultCurrency": 1, "fxRates": 1}
     )
     viewer_currency = fx_service.normalize_currency(
         (viewer or {}).get("defaultCurrency")
@@ -82,7 +84,10 @@ async def get_user_events(db: AsyncIOMotorDatabase, user_id: str) -> dict:
         fx_service.normalize_currency(e.get("currency")) for e in events
     }
     to_viewer_rates = await fx_service.get_rates_to(
-        viewer_currency, event_currencies, db=db
+        viewer_currency,
+        event_currencies,
+        db=db,
+        tables=[((viewer or {}).get("fxRates"), viewer_currency)],
     )
 
     for event in events:
@@ -236,13 +241,17 @@ async def save_event(
                 status_code=403, detail="You are not a member of this event"
             )
 
-        # Resolve users - could be ObjectId strings or email addresses
-        new_user_ids, invited = await _resolve_users(
-            db,
-            request_data.get("users", []),
-            actor_id=user_id,
-            extra_allowed={str(u) for u in event.get("users", [])},
-        )
+        # Resolve users - could be ObjectId strings or email addresses. An
+        # absent `users` key means "leave the membership alone", not "empty it".
+        if "users" in request_data:
+            new_user_ids, invited = await _resolve_users(
+                db,
+                request_data["users"],
+                actor_id=user_id,
+                extra_allowed={str(u) for u in event.get("users", [])},
+            )
+        else:
+            new_user_ids, invited = list(event.get("users", [])), []
 
         original_set = set(str(u) for u in event.get("users", []))
         modified_set = set(str(u) for u in new_user_ids)
@@ -262,9 +271,12 @@ async def save_event(
                     if str(s["userId"]) in removed_elements:
                         raise ValueError("Cannot remove user who is in expense shares")
 
+        # `.get(key, default)` returns None when the key is present *and* null,
+        # which a partial client update sends — that wiped the event's name.
         update_data = {
-            "eventName": request_data.get("eventName", event.get("eventName")),
-            "description": request_data.get("description", event.get("description", "")),
+            "eventName": request_data.get("eventName") or event.get("eventName"),
+            "description": request_data.get("description")
+            or event.get("description", ""),
             "users": new_user_ids,
             "updatedBy": ObjectId(user_id),
             "updatedAt": now,
@@ -283,7 +295,33 @@ async def save_event(
                     )
                 update_data["currency"] = new_currency
 
+        # The group's own FX rates. Unlike the currency these stay editable
+        # forever: they only affect expenses entered *after* the change, since
+        # each expense stores the rate it was converted at.
+        if request_data.get("fxRates") is not None:
+            update_data["fxRates"] = fx_service.clean_rate_table(
+                request_data["fxRates"]
+            )
+
+        if request_data.get("simplifyDebts") is not None:
+            update_data["simplifyDebts"] = bool(request_data["simplifyDebts"])
+
         await db.event.update_one({"_id": ObjectId(event_id)}, {"$set": update_data})
+
+        updated = await db.event.find_one({"_id": ObjectId(event_id)})
+        await audit_service.record(
+            db,
+            entity="event",
+            entity_id=event_id,
+            action="update",
+            actor_id=user_id,
+            # Removed members see the change that removed them.
+            audience=list(event.get("users", []))
+            + list((updated or {}).get("users", [])),
+            summary=f"the group {update_data['eventName']}",
+            before=audit_service.snapshot(event),
+            after=audit_service.snapshot(updated),
+        )
 
         # Auto-add friends
         for uid in new_user_ids:
@@ -313,9 +351,11 @@ async def save_event(
         currency = fx_service.normalize_currency(currency)
 
         new_event = {
-            "eventName": request_data.get("eventName", "Untitled Event"),
-            "description": request_data.get("description", ""),
+            "eventName": request_data.get("eventName") or "Untitled Event",
+            "description": request_data.get("description") or "",
             "currency": currency,
+            "fxRates": fx_service.clean_rate_table(request_data.get("fxRates")),
+            "simplifyDebts": bool(request_data.get("simplifyDebts")),
             "users": user_ids,
             "expenses": [],
             "createdBy": creator_oid,
@@ -324,6 +364,18 @@ async def save_event(
             "updatedAt": now,
         }
         result = await db.event.insert_one(new_event)
+        new_event["_id"] = result.inserted_id
+
+        await audit_service.record(
+            db,
+            entity="event",
+            entity_id=result.inserted_id,
+            action="create",
+            actor_id=user_id,
+            audience=user_ids,
+            summary=f"the group {new_event['eventName']}",
+            after=audit_service.snapshot(new_event),
+        )
 
         # Auto-add friends
         for uid in user_ids:
@@ -331,7 +383,6 @@ async def save_event(
                 await _auto_add_friend(db, user_id, str(uid))
 
         await _send_member_invites(db, user_id, invited)
-        new_event["_id"] = result.inserted_id
         return await get_event_by_id(db, str(result.inserted_id))
 
 
@@ -470,7 +521,9 @@ async def _auto_add_friend(db: AsyncIOMotorDatabase, user_id: str, friend_id: st
     )
 
 
-async def delete_event(db: AsyncIOMotorDatabase, event_id: str) -> dict:
+async def delete_event(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str | None = None
+) -> dict:
     """Delete an event and its expenses (if no unsettled dues)."""
     event = await db.event.find_one({"_id": ObjectId(event_id)})
     if not event:
@@ -486,119 +539,188 @@ async def delete_event(db: AsyncIOMotorDatabase, event_id: str) -> dict:
                     "success": "false",
                 }
 
-    # Delete all expenses
-    for expense_ref in event.get("expenses", []):
-        exp_id = expense_ref if isinstance(expense_ref, ObjectId) else ObjectId(expense_ref)
-        await db.expense.delete_one({"_id": exp_id})
+    # Snapshot the expenses before deleting them: undoing the group deletion
+    # has to bring its history back, not just an empty group.
+    expense_ids = [
+        expense_ref if isinstance(expense_ref, ObjectId) else ObjectId(expense_ref)
+        for expense_ref in event.get("expenses", [])
+    ]
+    deleted_expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
+        length=None
+    )
+    if expense_ids:
+        await db.expense.delete_many({"_id": {"$in": expense_ids}})
 
     await db.event.delete_one({"_id": ObjectId(event_id)})
+
+    await audit_service.record(
+        db,
+        entity="event",
+        entity_id=event_id,
+        action="delete",
+        actor_id=user_id or event.get("createdBy"),
+        audience=event.get("users", []),
+        summary=f"the group {event.get('eventName', '')}",
+        before=audit_service.snapshot(event),
+        extra={"deletedExpenses": deleted_expenses},
+    )
     return {"message": "Successfully deleted event", "success": "true"}
 
 
+#: Balances below this are treated as zero. Splitting a bill three ways leaves
+#: sub-cent residue that would otherwise show up as a "you owe ₹0.00" row and
+#: block event deletion forever.
+_SETTLED_EPSILON = 0.01
+
+
+def gross_debts(expenses: list) -> dict[str, dict[str, float]]:
+    """Raw ``{debtor: {creditor: amount}}`` implied by every expense.
+
+    A participant owes each payer in proportion to how much of the bill that
+    payer actually fronted, so a dinner two people split but one paid produces
+    a single debt, and one they both paid produces two.
+    """
+    debts: dict[str, dict[str, float]] = {}
+    for expense in expenses:
+        pay_shares = expense.get("payShares", [])
+        total_paid = sum(float(ps["amount"]) for ps in pay_shares)
+        if total_paid == 0:
+            continue
+        for share in expense.get("shares", []):
+            participant_id = str(share["userId"])
+            share_amount = float(share["amount"])
+            for pay_share in pay_shares:
+                payer_id = str(pay_share["userId"])
+                if participant_id == payer_id:
+                    continue
+                portion = share_amount * (float(pay_share["amount"]) / total_paid)
+                debts.setdefault(participant_id, {}).setdefault(payer_id, 0.0)
+                debts[participant_id][payer_id] += portion
+    return debts
+
+
+def net_pairwise(debts: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+    """Cancel each pair's two directions against each other.
+
+    A owing B ₹100 while B owes A ₹40 is one ₹60 debt, not two. Everything is
+    computed into a fresh dict — the previous implementation rewrote
+    ``amounts_owed`` while looping over it, which both corrupted the running
+    totals and could raise "dictionary changed size during iteration" once a
+    pair's reverse debt did not already exist.
+    """
+    people = set(debts) | {c for row in debts.values() for c in row}
+    netted: dict[str, dict[str, float]] = {}
+    for debtor in people:
+        for creditor in people:
+            if debtor >= creditor:  # visit each unordered pair once
+                continue
+            forward = debts.get(debtor, {}).get(creditor, 0.0)
+            reverse = debts.get(creditor, {}).get(debtor, 0.0)
+            net = forward - reverse
+            if net > _SETTLED_EPSILON:
+                netted.setdefault(debtor, {})[creditor] = net
+            elif -net > _SETTLED_EPSILON:
+                netted.setdefault(creditor, {})[debtor] = -net
+    return netted
+
+
+def simplify_debts(
+    debts: dict[str, dict[str, float]],
+) -> dict[str, dict[str, float]]:
+    """Reduce the whole group to the fewest transfers that clear every balance.
+
+    Pairwise netting still leaves A→B→C chains. This collapses each person to a
+    single net balance and then repeatedly settles the largest debtor against
+    the largest creditor, which is the standard greedy min-cash-flow reduction:
+    every transfer zeroes at least one person, so n people need at most n-1
+    transfers instead of up to n(n-1)/2.
+
+    Totals are preserved — each person's net position is identical to before,
+    only the routing changes. That is the whole trade-off: you may end up
+    paying someone you never shared a bill with.
+    """
+    balances: dict[str, float] = {}
+    for debtor, row in debts.items():
+        for creditor, amount in row.items():
+            balances[debtor] = balances.get(debtor, 0.0) - amount
+            balances[creditor] = balances.get(creditor, 0.0) + amount
+
+    debtors = sorted(
+        ((p, -b) for p, b in balances.items() if b < -_SETTLED_EPSILON),
+        key=lambda x: -x[1],
+    )
+    creditors = sorted(
+        ((p, b) for p, b in balances.items() if b > _SETTLED_EPSILON),
+        key=lambda x: -x[1],
+    )
+
+    simplified: dict[str, dict[str, float]] = {}
+    i = j = 0
+    while i < len(debtors) and j < len(creditors):
+        debtor, owed = debtors[i]
+        creditor, due = creditors[j]
+        transfer = min(owed, due)
+        if transfer > _SETTLED_EPSILON:
+            simplified.setdefault(debtor, {})[creditor] = (
+                simplified.setdefault(debtor, {}).get(creditor, 0.0) + transfer
+            )
+        debtors[i] = (debtor, owed - transfer)
+        creditors[j] = (creditor, due - transfer)
+        if debtors[i][1] <= _SETTLED_EPSILON:
+            i += 1
+        if creditors[j][1] <= _SETTLED_EPSILON:
+            j += 1
+    return simplified
+
+
 async def get_event_dues(db: AsyncIOMotorDatabase, event_id: str) -> dict:
-    """Calculate who owes whom within an event."""
+    """Calculate who owes whom within an event.
+
+    Groups with ``simplifyDebts`` set get the minimum-transfer routing; the
+    rest keep strict pairwise balances, so you only ever settle with people you
+    actually shared a bill with.
+    """
     event = await db.event.find_one({"_id": ObjectId(event_id)})
     if not event:
         return {"error": "Event not found"}
 
-    # Get all expenses for the event
-    expense_ids = []
-    for exp_ref in event.get("expenses", []):
-        exp_id = exp_ref if isinstance(exp_ref, ObjectId) else ObjectId(exp_ref)
-        expense_ids.append(exp_id)
-
+    expense_ids = [
+        exp_ref if isinstance(exp_ref, ObjectId) else ObjectId(exp_ref)
+        for exp_ref in event.get("expenses", [])
+    ]
     expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
         length=None
     )
 
-    amounts_owed = {}
-    user_name_map = {}
-    calculated_list = []
+    simplify = bool(event.get("simplifyDebts"))
+    debts = gross_debts(expenses)
+    debts = simplify_debts(debts) if simplify else net_pairwise(debts)
 
-    for expense in expenses:
-        shares = expense.get("shares", [])
-        pay_shares = expense.get("payShares", [])
+    # One name lookup per person, not per pair.
+    people = set(debts) | {c for row in debts.values() for c in row}
+    user_name_map = {p: await get_user_name_by_id(db, p) for p in people}
 
-        for pay_share in pay_shares:
-            payer_id = str(pay_share["userId"])
-
-            for share in shares:
-                share_amount = float(share["amount"])
-                participant_id = str(share["userId"])
-
-                if participant_id == payer_id:
-                    continue
-
-                if participant_id not in amounts_owed:
-                    amounts_owed[participant_id] = {}
-                if payer_id not in amounts_owed[participant_id]:
-                    amounts_owed[participant_id][payer_id] = 0.0
-
-                total_paid = sum(float(ps["amount"]) for ps in pay_shares)
-                payer_ratio = (
-                    float(pay_share["amount"]) / total_paid if total_paid != 0 else 0
-                )
-                proportional_share = share_amount * payer_ratio
-
-                amounts_owed[participant_id][payer_id] += proportional_share
-
-    # Resolve net debts
-    for participant, debts in amounts_owed.items():
-        for payer, amount in debts.items():
-            key1 = payer + participant
-            key2 = participant + payer
-            if key1 not in calculated_list and key2 not in calculated_list:
-                reverse_exist = False
-                payer_to_participant = 0
-                participant_to_payer = amount
-
-                if payer in amounts_owed and participant in amounts_owed[payer]:
-                    reverse_exist = True
-                    payer_to_participant = amounts_owed[payer][participant]
-
-                net_amount = participant_to_payer - payer_to_participant
-                if net_amount > 0:
-                    amounts_owed[participant][payer] = net_amount
-                    if reverse_exist:
-                        amounts_owed[payer][participant] = 0
-                elif net_amount < 0:
-                    if not reverse_exist:
-                        amounts_owed[payer] = amounts_owed.get(payer, {})
-                    amounts_owed[payer][participant] = -net_amount
-                    amounts_owed[participant][payer] = 0
-                else:
-                    if reverse_exist:
-                        amounts_owed[payer][participant] = 0
-                    amounts_owed[participant][payer] = 0
-
-                if payer not in user_name_map:
-                    user_name_map[payer] = await get_user_name_by_id(db, payer)
-                if participant not in user_name_map:
-                    user_name_map[participant] = await get_user_name_by_id(
-                        db, participant
-                    )
-
-                calculated_list.append(key1)
-
-    # Format response
-    event_dues = []
-    for debtor in amounts_owed:
-        debtor_name = user_name_map.get(str(debtor), "Unknown")
-        creditor_details = []
-        for creditor in amounts_owed[debtor]:
-            amount = amounts_owed[debtor][creditor]
-            if amount != 0:
-                creditor_name = user_name_map.get(str(creditor), "Unknown")
-                creditor_details.append(
-                    {"id": creditor, "name": creditor_name, "amount": amount}
-                )
-        event_dues.append(
-            {"id": debtor, "debtor": debtor_name, "creditorDetails": creditor_details}
-        )
+    event_dues = [
+        {
+            "id": debtor,
+            "debtor": user_name_map.get(debtor, "Unknown"),
+            "creditorDetails": [
+                {
+                    "id": creditor,
+                    "name": user_name_map.get(creditor, "Unknown"),
+                    "amount": round(amount, 2),
+                }
+                for creditor, amount in row.items()
+                if amount > _SETTLED_EPSILON
+            ],
+        }
+        for debtor, row in debts.items()
+    ]
 
     return {
         "eventDues": event_dues,
         "currency": event.get("currency", settings.DEFAULT_CURRENCY),
+        "simplifyDebts": simplify,
     }
 
 
@@ -609,6 +731,7 @@ async def get_event_dues_for_user(
     result = {
         "userName": "",
         "currency": settings.DEFAULT_CURRENCY,
+        "simplifyDebts": False,
         "inDebtTo": [],
         "isOwed": [],
         "totalDebt": 0,
@@ -622,6 +745,7 @@ async def get_event_dues_for_user(
     result["currency"] = event_dues_summary.get(
         "currency", settings.DEFAULT_CURRENCY
     )
+    result["simplifyDebts"] = bool(event_dues_summary.get("simplifyDebts"))
 
     if event_dues_summary and "eventDues" in event_dues_summary:
         for person_in_debt in event_dues_summary["eventDues"]:

@@ -107,7 +107,13 @@ async def update_expense(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    request_data = request.model_dump(by_alias=True)
+    # `exclude_unset` matters here: a plain model_dump emits every optional
+    # field at its default, so an edit form that never touches the split still
+    # sent `shares: []` and `payShares: []` — which the service faithfully
+    # wrote, erasing the split and making the expense vanish from every list
+    # that queries on payShares. Only fields the client actually sent are
+    # applied.
+    request_data = request.model_dump(by_alias=True, exclude_unset=True)
     result = await expense_service.update_expense(db, user_id, expense_id, request_data)
     return result
 

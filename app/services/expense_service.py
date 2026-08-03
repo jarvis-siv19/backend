@@ -3,8 +3,15 @@ from bson import ObjectId
 from fastapi import HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.config import settings
-from app.services import fx_service
+from app.services import audit_service, fx_service
 from app.services.user_service import serialize_doc
+
+
+def _expense_summary(expense: dict) -> str:
+    """One line naming the expense and what it cost, for the activity feed."""
+    amount = float(expense.get("originalAmount", expense.get("amount", 0)))
+    currency = expense.get("currency", settings.DEFAULT_CURRENCY)
+    return f"{expense.get('expenseName', 'an expense')} ({currency} {amount:,.2f})"
 
 
 async def user_can_access_expense(
@@ -94,6 +101,23 @@ async def _resolve_base_currency(
     return fx_service.normalize_currency((creator or {}).get("defaultCurrency"))
 
 
+def _explicit_rate(request_data: dict) -> float | None:
+    """A per-expense ``fxRate`` typed in by whoever entered the expense.
+
+    This is what the transaction actually cost them — card markup included — so
+    it outranks every table. Zero/negative/garbage is ignored rather than
+    rejected, so a stray value can't make an expense unsavable.
+    """
+    raw = request_data.get("fxRate")
+    if raw in (None, ""):
+        return None
+    try:
+        rate = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return rate if rate > 0 else None
+
+
 async def create_expense(
     db: AsyncIOMotorDatabase, user_id: str, request_data: dict
 ) -> dict:
@@ -167,7 +191,15 @@ async def create_expense(
     currency = fx_service.normalize_currency(
         request_data.get("currency") or base_currency
     )
-    fx_rate = await fx_service.get_rate(currency, base_currency, on=expense_date, db=db)
+    fx_rate = _explicit_rate(request_data)
+    if fx_rate is None or currency == base_currency:
+        fx_rate = await fx_service.get_rate(
+            currency,
+            base_currency,
+            on=expense_date,
+            db=db,
+            tables=await fx_service.context_rate_tables(db, user_id, event),
+        )
 
     # Amounts are stored converted to the base currency; the entered amounts
     # are kept as originalAmount for display/editing.
@@ -225,6 +257,17 @@ async def create_expense(
         result = await db.expense.insert_one(new_expense)
         new_expense["_id"] = result.inserted_id
 
+    await audit_service.record(
+        db,
+        entity="expense",
+        entity_id=new_expense["_id"],
+        action="create",
+        actor_id=user_id,
+        audience=audit_service.expense_audience(new_expense, event),
+        summary=_expense_summary(new_expense),
+        after=audit_service.snapshot(new_expense),
+    )
+
     return {
         "message": "Expense created!",
         "success": "true",
@@ -278,7 +321,7 @@ async def get_expense_by_id(
         created_by_name = creator["name"] if creator else "Unknown"
 
     updated_by_name = "you"
-    if str(expense.get("updatedBy")) != user_id:
+    if expense.get("updatedBy") and str(expense["updatedBy"]) != user_id:
         updater = await db.users.find_one({"_id": expense["updatedBy"]})
         updated_by_name = updater["name"] if updater else "Unknown"
 
@@ -370,7 +413,15 @@ async def update_expense(
             except (ValueError, TypeError):
                 date_val = expense.get("date")
 
-    fx_rate = await fx_service.get_rate(currency, base_currency, on=date_val, db=db)
+    fx_rate = _explicit_rate(request_data)
+    if fx_rate is None or currency == base_currency:
+        fx_rate = await fx_service.get_rate(
+            currency,
+            base_currency,
+            on=date_val,
+            db=db,
+            tables=await fx_service.context_rate_tables(db, user_id, event),
+        )
 
     update_data = {
         "expenseName": expense_name,
@@ -390,7 +441,10 @@ async def update_expense(
     if "type" in request_data:
         update_data["type"] = request_data["type"]
 
-    if "payShares" in request_data:
+    # Belt and braces alongside the router's exclude_unset: an expense with no
+    # shares is unreachable from every list in the app, so an empty list is
+    # treated as "not provided" rather than "remove everyone".
+    if request_data.get("payShares"):
         new_pay_shares = []
         for ps in request_data["payShares"]:
             ps_amount = float(ps["amount"])
@@ -403,7 +457,7 @@ async def update_expense(
             )
         update_data["payShares"] = new_pay_shares
 
-    if "shares" in request_data:
+    if request_data.get("shares"):
         new_shares = []
         for s in request_data["shares"]:
             s_amount = float(s["amount"])
@@ -418,6 +472,24 @@ async def update_expense(
         update_data["shares"] = new_shares
 
     await db.expense.update_one({"_id": ObjectId(expense_id)}, {"$set": update_data})
+
+    updated = await db.expense.find_one({"_id": ObjectId(expense_id)})
+    # Audience is the union of both versions: someone dropped from the split
+    # still needs to see that they were dropped.
+    audience = audit_service.expense_audience(
+        expense, event
+    ) + audit_service.expense_audience(updated or {}, event)
+    await audit_service.record(
+        db,
+        entity="expense",
+        entity_id=expense_id,
+        action="update",
+        actor_id=user_id,
+        audience=audience,
+        summary=_expense_summary(updated or expense),
+        before=audit_service.snapshot(expense),
+        after=audit_service.snapshot(updated),
+    )
     return {"message": "Successfully updated expense", "success": "true"}
 
 
@@ -434,13 +506,26 @@ async def delete_expense(
         )
 
     # Remove from event if linked
+    event = None
     if expense.get("eventId"):
+        event = await db.event.find_one({"_id": expense["eventId"]}, {"users": 1})
         await db.event.update_one(
             {"_id": expense["eventId"]},
             {"$pull": {"expenses": expense["_id"]}},
         )
 
     await db.expense.delete_one({"_id": ObjectId(expense_id)})
+
+    await audit_service.record(
+        db,
+        entity="expense",
+        entity_id=expense_id,
+        action="delete",
+        actor_id=user_id,
+        audience=audit_service.expense_audience(expense, event),
+        summary=_expense_summary(expense),
+        before=audit_service.snapshot(expense),
+    )
     return {"message": "Successfully deleted expense", "success": "true"}
 
 

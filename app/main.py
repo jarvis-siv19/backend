@@ -1,11 +1,20 @@
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.database import connect_to_mongo, close_mongo_connection, ping_database
+from app.database import (
+    connect_to_mongo,
+    close_mongo_connection,
+    get_db,
+    ping_database,
+)
 
 from app.routers import (
+    activity_router,
     auth_router,
+    card_router,
     user_router,
     dashboard_router,
     event_router,
@@ -22,14 +31,44 @@ from app.routers import (
 )
 
 
+#: How often the reminder loop wakes. Hourly rather than daily so a container
+#: that restarts (Code Engine recycles instances freely) still checks in soon
+#: after, instead of waiting up to a day. Sends are de-duplicated in the
+#: database, so waking often costs a query and mails nobody twice.
+_REMINDER_INTERVAL_SECONDS = 60 * 60
+
+
+async def _reminder_loop():
+    """Send credit-card bill reminders that have come due."""
+    from app.services import card_service
+
+    while True:
+        try:
+            await card_service.send_due_reminders(get_db())
+            await card_service.purge_old_reminder_logs(get_db())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # A failed pass must not kill the loop — the next one retries, and
+            # unsent reminders are still unclaimed.
+            logging.getLogger(__name__).error("Reminder pass failed: %s", e)
+        await asyncio.sleep(_REMINDER_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle events."""
     # Startup
     await connect_to_mongo()
+    reminders = asyncio.create_task(_reminder_loop())
     print("SplitLLM Backend started")
     yield
     # Shutdown
+    reminders.cancel()
+    try:
+        await reminders
+    except asyncio.CancelledError:
+        pass
     await close_mongo_connection()
     print("SplitLLM Backend stopped")
 
@@ -100,6 +139,12 @@ app.include_router(fx_router.router, prefix="/db", tags=["FX"])
 
 # Import routes: /db/import/splitwise, /db/import/splitwise/preview
 app.include_router(import_router.router, prefix="/db/import", tags=["Import"])
+
+# Activity routes: /db/activity, /db/activity/:id/undo
+app.include_router(activity_router.router, prefix="/db", tags=["Activity"])
+
+# Credit-card bill reminder routes: /db/cards
+app.include_router(card_router.router, prefix="/db", tags=["Cards"])
 
 # Version route: /version (public; drives the in-app update prompt)
 app.include_router(version_router.router, tags=["Version"])

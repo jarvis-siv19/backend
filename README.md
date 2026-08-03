@@ -108,7 +108,57 @@ Once running, visit:
 | Friends | DELETE | `/db/deleteFriend` | ✅ |
 | Friends | GET | `/db/user/expense/friend/:id` | ✅ |
 | Friends | POST | `/db/user/expense/friend/:id/settleup` | ✅ |
+| Settlements | GET | `/db/settlements` | ✅ |
+| Settlements | POST | `/db/settlements/:id/confirm` | ✅ |
+| Settlements | POST | `/db/settlements/:id/reject` | ✅ |
+| Activity | GET | `/db/activity` | ✅ |
+| Activity | POST | `/db/activity/:id/undo` | ✅ |
+| Cards | GET | `/db/cards` | ✅ |
+| Cards | POST | `/db/cards` | ✅ |
+| Cards | PUT | `/db/cards/:id` | ✅ |
+| Cards | DELETE | `/db/cards/:id` | ✅ |
+| FX | GET | `/db/fx/currencies` | ❌ |
+| FX | GET | `/db/fx/rate` | ✅ |
 | Payments | GET | `/db/payment/:link` | ❌ |
+
+### Currency conversion
+
+There is no live FX feed, on purpose: the rate a person is actually charged
+includes their card's forex markup, so a mid-market quote would be wrong. Rates
+are resolved most-specific-first:
+
+1. an explicit `fxRate` on the expense — what that transaction really cost;
+2. the group's `fxRates` table (`{code: rate into the group's currency}`);
+3. the user's own `fxRates` table, for friend-to-friend and solo expenses;
+4. the `fx_rates` collection, then `FX_API_URL` if one is configured;
+5. identity (1.0), with a warning — nothing has been told to us yet.
+
+`GET /db/fx/rate` returns a `source` field naming which of these answered, so
+the client can prompt for a rate instead of converting silently.
+
+### Settle-up confirmation
+
+Whoever *owes* money can only claim to have paid it, so `POST .../settleup`
+from the debtor creates a pending `settlement_request` and returns
+`status: "pending"`; the creditor confirms it via `/db/settlements/:id/confirm`.
+When the creditor initiates, there is nobody left to confirm and it completes
+immediately (`status: "settled"`). Emails go to **both** parties, and only once
+the settlement is recorded — never on a pending request.
+
+### Activity log
+
+Expense, event, and settlement writes append to `audit_log` with a full
+before/after document snapshot, visible to everyone the change affected.
+`POST /db/activity/:id/undo` restores that snapshot. Undo is refused if the
+document changed afterwards (409), if it was already undone, or outside the
+7-day window.
+
+### Credit-card reminders
+
+`credit_cards` stores a name, optional last four digits, and the **day of the
+month** a bill falls due. A background loop in the app lifespan sends email
+reminders 10 and 5 days ahead. Sends are de-duplicated by a unique index on
+`card_reminder_log`, so running on several instances mails nobody twice.
 
 ## Environment Variables
 

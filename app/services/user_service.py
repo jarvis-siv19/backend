@@ -315,6 +315,7 @@ async def get_user_account(db: AsyncIOMotorDatabase, uid: str) -> dict | None:
         "friendCode": friend_code,
         "upiId": user.get("upiId", ""),
         "defaultCurrency": user.get("defaultCurrency", settings.DEFAULT_CURRENCY),
+        "fxRates": user.get("fxRates", {}),
         "uuid": friend_code,
         "role": user.get("role", "user"),
         "invitedBy": user.get("invitedBy"),
@@ -337,6 +338,8 @@ async def update_user_account(
         if currency not in fx_service.SUPPORTED_CURRENCIES:
             raise HTTPException(status_code=400, detail="Unsupported currency")
         update_fields["defaultCurrency"] = currency
+    if data.get("fxRates") is not None:
+        update_fields["fxRates"] = fx_service.clean_rate_table(data["fxRates"])
 
     result = await db.users.update_one(
         {"firebaseUid": uid}, {"$set": update_fields}

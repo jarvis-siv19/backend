@@ -45,6 +45,9 @@ class UpdateAccountRequest(BaseModel):
     name: Optional[str] = None
     upiId: Optional[str] = None
     defaultCurrency: Optional[str] = None
+    # Personal FX table: {currency code: rate into defaultCurrency}. Used for
+    # friend-to-friend and solo expenses, which have no group to inherit from.
+    fxRates: Optional[dict[str, float]] = None
 
 
 # ─── Dashboard ──────────────────────────────────────────────────────────
@@ -84,6 +87,11 @@ class EventCreate(BaseModel):
     description: str = ""
     members: list[str] = Field(default_factory=list, alias="users")
     currency: Optional[str] = None
+    # {currency code: rate into this event's currency}, set by the members.
+    fxRates: Optional[dict[str, float]] = None
+    # Net everyone's balance down to the fewest transfers (Splitwise's
+    # "simplify debts") instead of settling each pair separately.
+    simplifyDebts: Optional[bool] = None
 
     class Config:
         populate_by_name = True
@@ -95,6 +103,8 @@ class EventUpdate(BaseModel):
     description: str = ""
     members: list[str] = Field(default_factory=list, alias="users")
     currency: Optional[str] = None
+    fxRates: Optional[dict[str, float]] = None
+    simplifyDebts: Optional[bool] = None
 
     class Config:
         populate_by_name = True
@@ -133,6 +143,9 @@ class ExpenseCreate(BaseModel):
     type: str = "normal"
     date: str = ""
     currency: Optional[str] = None  # transaction currency; defaults to context currency
+    # What this transaction actually cost in the context currency, per unit of
+    # `currency` — card markup included. Beats every stored rate table.
+    fxRate: Optional[float] = None
     shares: list[ShareModel] = Field(default_factory=list)
     payShares: list[PayShareModel] = Field(default_factory=list)
 
@@ -151,6 +164,7 @@ class ExpenseUpdate(BaseModel):
     type: Optional[str] = None
     date: Optional[str] = None
     currency: Optional[str] = None
+    fxRate: Optional[float] = None
     shares: list[ShareModel] = Field(default_factory=list)
     payShares: list[PayShareModel] = Field(default_factory=list)
 

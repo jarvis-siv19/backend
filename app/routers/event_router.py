@@ -74,7 +74,10 @@ async def update_event(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    request_data = request.model_dump(by_alias=True)
+    # Only the fields the client actually sent. A plain model_dump emits every
+    # optional field at its default, so an update that just flips one setting
+    # also sent `users: []` — which read as "remove everyone from the group".
+    request_data = request.model_dump(by_alias=True, exclude_unset=True)
 
     try:
         result = await event_service.save_event(db, user_id, request_data)
@@ -94,7 +97,7 @@ async def delete_event(
     if not user_id or not await event_service.is_event_member(db, event_id, user_id):
         raise HTTPException(status_code=404, detail="Event not found")
 
-    result = await event_service.delete_event(db, event_id)
+    result = await event_service.delete_event(db, event_id, user_id)
     return result
 
 

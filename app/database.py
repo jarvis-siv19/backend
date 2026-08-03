@@ -25,6 +25,30 @@ async def _seed_database(db: AsyncIOMotorDatabase):
     await db.users.create_index([("firebaseUid", pymongo.ASCENDING)], unique=True, sparse=True)
     await db.users.create_index([("friendCode", pymongo.ASCENDING)], unique=True, sparse=True)
 
+    # Activity feed: every read is "entries visible to me, newest first".
+    await db.audit_log.create_index(
+        [("visibleTo", pymongo.ASCENDING), ("createdAt", pymongo.DESCENDING)]
+    )
+    # Settle-ups are looked up by either party, and only pending ones matter.
+    await db.settlement_request.create_index(
+        [("payerId", pymongo.ASCENDING), ("status", pymongo.ASCENDING)]
+    )
+    await db.settlement_request.create_index(
+        [("payeeId", pymongo.ASCENDING), ("status", pymongo.ASCENDING)]
+    )
+    await db.credit_cards.create_index([("userId", pymongo.ASCENDING)])
+    # This unique index *is* the reminder de-duplication: a second attempt to
+    # send the same (card, due date, lead time) fails the insert instead of
+    # mailing the user twice. See card_service._claim_reminder.
+    await db.card_reminder_log.create_index(
+        [
+            ("cardId", pymongo.ASCENDING),
+            ("dueDate", pymongo.ASCENDING),
+            ("leadDays", pymongo.ASCENDING),
+        ],
+        unique=True,
+    )
+
     # Drop the legacy `password` field. Supabase is the sole authenticator and
     # nothing here ever verified this hash, so it was a shadow copy of the
     # user's real credential. Idempotent: a no-op once every document is clean.
