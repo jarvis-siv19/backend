@@ -9,6 +9,13 @@
 #   ./deploy.sh --free       # free-tier sizing: scales to zero, cold starts
 #
 # Requires: ibmcloud CLI with the code-engine plugin, and `ibmcloud login`.
+#
+# Routine code deploys are automated — .github/workflows/deploy.yml runs on
+# every push to main. Run this script when you need to do something that
+# workflow deliberately cannot: create the app for the first time (which needs
+# interactive prompts), change env values in secrets.env, or change sizing.
+# It also deploys your *working tree* rather than the pushed commit, which is
+# useful for a hotfix and a hazard otherwise — push first.
 set -euo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)

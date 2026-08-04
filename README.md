@@ -205,8 +205,93 @@ Verify: `/health` returns `{"status":"healthy","database":"connected"}` and
 `/ready` returns 200 (503 while Mongo is unreachable — readiness gates slow
 startup without killing the instance).
 
-> **Deployment is not automated.** `.github/workflows/deploy.yml` runs tests
-> only. A green CI does **not** mean the backend shipped — run `./ibm/deploy.sh`.
+### Automated deployment (push to main)
+
+`.github/workflows/deploy.yml` deploys every push to `main` once the tests
+pass. The manual script above still works and is the escape hatch.
+
+Two things the workflow deliberately does **not** do:
+
+- **It never runs `app create`.** Creating a Code Engine app establishes its
+  build configuration, including the registry secret the built image is pushed
+  to, and that needs interactive prompts a CI job cannot answer. The app must
+  exist first — created once from a laptop with `./ibm/deploy.sh`. CI only
+  updates it.
+- **It never sets environment variables.** Those live in the `splitllm-env`
+  Code Engine secret, whose source of truth is `ibm/secrets.env`. If CI also
+  passed env values, the app's configuration would have two owners that
+  silently disagree — and the GitHub copy would drift, because it is the one
+  nobody looks at. To change an env value, edit `ibm/secrets.env` and run
+  `./ibm/deploy.sh`.
+
+Sizing is likewise owned by `deploy.sh` (`--cpu`, `--memory`, `--min-scale`),
+so a CI deploy preserves whatever the last manual run set.
+
+**One-time setup.** The deploy needs an API key belonging to a *service ID*,
+not to a person — a personal key carries all of that person's permissions and
+stops working when they rotate it or leave.
+
+Everything below lives under **Manage → Access (IAM)** in the IBM Cloud
+console. The CLI equivalents are given for reference, but the console is the
+easier path since creating the credential requires an interactive login anyway.
+
+1. **Service ID** — *Service IDs → Create*, named `splitllm-ci`.
+
+   ```bash
+   ibmcloud iam service-id-create splitllm-ci \
+     --description "GitHub Actions deploy for splitllmbill/backend"
+   ```
+
+2. **Code Engine access** — on the service ID, *Access → Assign access →
+   Code Engine*, scoped to the resource group (or just the `splitllm`
+   project). This needs **two** roles, which is easy to get wrong: platform
+   `Viewer` to select the project, and service `Writer` to update the app.
+   Neither alone is enough, and the resulting failure is a 403 during
+   `project select` or `app update` rather than at login.
+
+   ```bash
+   ibmcloud iam service-policy-create splitllm-ci \
+     --roles Viewer,Writer --service-name codeengine
+   ```
+
+3. **Resource group access** — a *separate* policy, and the one most often
+   missed: *Assign access → Resource group → Default → Viewer*. Without it
+   the workflow cannot target the resource group at login.
+
+   ```bash
+   ibmcloud iam service-policy-create splitllm-ci \
+     --roles Viewer --resource-group-name Default
+   ```
+
+4. **API key** — on the service ID, *API keys → Create*. **Copy it
+   immediately**; IBM displays the value once and cannot show it again. If it
+   is lost, delete the key and create another.
+
+   ```bash
+   ibmcloud iam service-api-key-create splitllm-ci-key splitllm-ci \
+     --description "GitHub Actions" --output json
+   ```
+
+5. **GitHub** — add that value as the repo secret **`IBMCLOUD_API_KEY`**
+   (Settings → Secrets and variables → Actions → New repository secret).
+
+If a deploy fails with a permissions error despite the above, widen the Code
+Engine policy to platform `Editor` + service `Manager` to confirm it is a
+scoping problem, then narrow it back down.
+
+The region, resource group, project, and app name fall back to the values
+`deploy.sh` uses (`in-che` / `Default` / `splitllm` / `splitllm-api`). Override
+any of them with repo *variables* `CE_REGION`, `CE_RESOURCE_GROUP`,
+`CE_PROJECT`, `CE_APP` — variables, not secrets; none of them are sensitive.
+
+The `deploy` job targets a GitHub **environment** named `production`. Creating
+it is optional, but adding a required reviewer there turns every deploy into a
+manual approval if you want that gate later.
+
+After deploying, the job polls `/ready` until it answers. `app update --wait`
+only reports that the revision came up, which is not the same as it being able
+to serve — without the poll, a backend that starts but cannot reach Mongo
+reports a green deploy.
 
 ## Legacy: Zoho Catalyst AppSail (no longer used)
 

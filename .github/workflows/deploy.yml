@@ -5,14 +5,21 @@ on:
   push:
     branches: [main]
 
-# Deployment is NOT automated. Production runs on IBM Cloud Code Engine and is
-# deployed by running ./ibm/deploy.sh from a machine with `ibmcloud login`.
+# Deployment target is IBM Cloud Code Engine (project `splitllm`, app
+# `splitllm-api`, region in-che). See README "Deployment" and ibm/deploy.sh.
 #
 # This workflow used to deploy to Zoho Catalyst AppSail on every push to main.
 # Production moved to Code Engine, but the job stayed — so it kept reporting
 # success while deploying to a host that serves 404, which made a green CI look
-# like the backend had shipped when it had not. Removed rather than left
-# misleading. See README "Deployment".
+# like the backend had shipped when it had not. That job was removed; the
+# `deploy` job below is its Code Engine replacement.
+
+# One deploy at a time. Two overlapping `app update` calls race to set the
+# active revision, and the winner is whichever build finishes last — not
+# whichever commit is newer.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   test:
@@ -30,3 +37,76 @@ jobs:
           cache: pip
       - run: pip install -r requirements-dev.txt
       - run: pytest
+
+  deploy:
+    # A failing test must never reach production.
+    needs: test
+    # Pushes to main only. Pull requests must not deploy, and GitHub does not
+    # expose secrets to fork PRs anyway — the job would fail confusingly rather
+    # than be skipped cleanly.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install IBM Cloud CLI and the Code Engine plugin
+        run: |
+          curl -fsSL https://clis.cloud.ibm.com/install/linux | sh
+          ibmcloud plugin install code-engine -f
+
+      - name: Log in and select the project
+        env:
+          IBMCLOUD_API_KEY: ${{ secrets.IBMCLOUD_API_KEY }}
+        run: |
+          # Name the missing credential outright. `ibmcloud login` with an empty
+          # key fails with a generic auth error that reads like a bad key or an
+          # expired one, sending you to debug IAM instead of GitHub settings.
+          if [ -z "$IBMCLOUD_API_KEY" ]; then
+            echo "::error::Repo secret IBMCLOUD_API_KEY is not set. See README → Deployment → Automated deployment for how to create the service ID and key."
+            exit 1
+          fi
+          # An API key, not --sso: SSO is interactive by design and cannot run
+          # unattended. The key belongs to a service ID scoped to this project
+          # (see README "Automated deployment").
+          ibmcloud login --apikey "$IBMCLOUD_API_KEY" \
+            -r "${{ vars.CE_REGION || 'in-che' }}" \
+            -g "${{ vars.CE_RESOURCE_GROUP || 'Default' }}"
+          ibmcloud ce project select --name "${{ vars.CE_PROJECT || 'splitllm' }}"
+
+      - name: Deploy
+        run: |
+          # `app update`, never `app create`. The app's build configuration —
+          # including the registry secret Code Engine pushes the built image to
+          # — is established on first creation from a laptop via ibm/deploy.sh,
+          # and creating it needs interactive prompts this job cannot answer.
+          #
+          # Env vars are deliberately NOT set here. They live in the Code Engine
+          # secret `splitllm-env`, whose source of truth is ibm/secrets.env
+          # (gitignored). Passing them from GitHub too would give the app's
+          # configuration two owners that silently disagree.
+          ibmcloud ce app update \
+            --name "${{ vars.CE_APP || 'splitllm-api' }}" \
+            --build-source . \
+            --build-dockerfile Dockerfile \
+            --build-strategy dockerfile \
+            --wait --wait-timeout 900
+
+      - name: Verify the new revision serves traffic
+        run: |
+          # `app update --wait` returns once the revision is ready, which is not
+          # the same as the app being able to answer. /ready is 503 while Mongo
+          # is unreachable, so this catches a deploy that came up but cannot
+          # serve — exactly the failure a green deploy would otherwise hide.
+          URL=$(ibmcloud ce app get --name "${{ vars.CE_APP || 'splitllm-api' }}" --output url)
+          echo "Deployed: $URL"
+          for attempt in $(seq 1 10); do
+            if curl -fsS --max-time 10 "$URL/ready"; then
+              echo "==> Ready"
+              exit 0
+            fi
+            echo "not ready yet (attempt $attempt)"
+            sleep 10
+          done
+          echo "::error::App did not become ready; check 'ibmcloud ce app logs --name splitllm-api'"
+          exit 1
