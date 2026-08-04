@@ -100,7 +100,15 @@ def send_in_background(coro) -> None:
     task.add_done_callback(_log_result)
 
 
-async def send_invite_email(to_email: str, to_name: str, inviter_name: str) -> bool:
+async def send_invite_email(
+    to_email: str, to_name: str, inviter_name: str, invite_code: str = ""
+) -> bool:
+    """Invite someone who was added to expenses before they had an account.
+
+    ``invite_code`` is the inviter's friend code (or a group's join code).
+    Registration requires one, so the link carries it — without it the invitee
+    lands on a signup form demanding a code they were never given.
+    """
     inviter = html.escape(inviter_name or "A friend")
     name = html.escape(to_name or "there")
     body = (
@@ -109,11 +117,14 @@ async def send_invite_email(to_email: str, to_name: str, inviter_name: str) -> b
         "Sign up with this email address and your expense history will be "
         "waiting for you.</p>"
     )
+    link = settings.APP_BASE_URL
+    if invite_code:
+        link = f"{settings.APP_BASE_URL.rstrip('/')}/i/{invite_code}"
     return await _send(
         to_email,
         to_name,
         f"{inviter_name or 'A friend'} added you to shared expenses on SplitLLM",
-        _render("You've been added to shared expenses", body, "Join SplitLLM", settings.APP_BASE_URL),
+        _render("You've been added to shared expenses", body, "Join SplitLLM", link),
     )
 
 

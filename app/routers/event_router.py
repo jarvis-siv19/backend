@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.models.schemas import EventCreate, EventUpdate
+from app.models.schemas import EventCreate, EventUpdate, JoinGroupRequest
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_current_user
 from app.database import get_db
@@ -99,6 +99,96 @@ async def delete_event(
 
     result = await event_service.delete_event(db, event_id, user_id)
     return result
+
+
+@router.get("/event/{event_id}/invite")
+async def get_event_invite(
+    event_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Get (creating on first use) the group's join code."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return await event_service.get_join_link(db, event_id, user_id)
+
+
+@router.post("/event/{event_id}/invite")
+async def rotate_event_invite(
+    event_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Issue a fresh join code, invalidating every link shared so far."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return await event_service.get_join_link(db, event_id, user_id, rotate=True)
+
+
+@router.delete("/event/{event_id}/invite")
+async def disable_event_invite(
+    event_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Stop accepting joins by link for this group."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id or not await event_service.is_event_member(db, event_id, user_id):
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    return await event_service.disable_join_link(db, event_id, user_id)
+
+
+@router.get("/join/{code}")
+async def preview_join(
+    code: str,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Public: what group an invite link points at.
+
+    Unauthenticated on purpose — someone following the link has to see what
+    they are being invited to *before* creating an account. Only the group's
+    name, size and currency are exposed; see event_service.preview_join_code.
+    """
+    return await event_service.preview_join_code(db, code)
+
+
+@router.get("/join/{code}/claimable")
+async def claimable_members(
+    code: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Placeholder members a joiner can identify themselves as.
+
+    Signed-in only: unlike the preview above this returns member names.
+    """
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return await event_service.get_claimable_members(db, code)
+
+
+@router.post("/join/{code}")
+async def join_by_code(
+    code: str,
+    request: JoinGroupRequest | None = None,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Join the group an invite link points at, optionally claiming a slot."""
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    if not user_id:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return await event_service.join_event_by_code(
+        db, code, user_id, claim_member_id=(request.claimMemberId if request else "")
+    )
 
 
 @router.get("/event/{event_id}/expenses")

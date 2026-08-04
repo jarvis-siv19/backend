@@ -184,17 +184,21 @@ async def import_splitwise(
 ) -> dict:
     """Create an event + expenses from a parsed Splitwise export.
 
-    ``mapping``: CSV member name -> {"userId": "..."} or {"email": "...",
-    "name": "..."} (email creates/reuses a phantom user).
+    ``mapping``: CSV member name -> one of
+
+    * ``{"userId": "..."}`` — an existing account;
+    * ``{"email": "...", "name": "..."}`` — creates/reuses a phantom user and
+      emails them an invite;
+    * ``{"name": "..."}`` or nothing at all — a name-only placeholder. The
+      import runs without anyone having to be identified up front; each of
+      those people can claim their own slot later via the group's invite link.
     """
     importer = await user_service.get_user_by_id(db, user_id)
     importer_name = (importer or {}).get("name", "")
 
     member_ids: dict[str, str] = {}
     for member in parsed["members"]:
-        target = mapping.get(member)
-        if not target:
-            raise ValueError(f"No mapping provided for member '{member}'")
+        target = mapping.get(member) or {}
         if target.get("userId"):
             member_ids[member] = target["userId"]
         elif target.get("email"):
@@ -208,10 +212,14 @@ async def import_splitwise(
                         to_email=target["email"],
                         to_name=phantom.get("name", ""),
                         inviter_name=importer_name,
+                        invite_code=(importer or {}).get("friendCode", ""),
                     )
                 )
         else:
-            raise ValueError(f"Mapping for '{member}' needs a userId or email")
+            placeholder = await user_service.create_placeholder_user(
+                db, name=target.get("name") or member, created_by=user_id
+            )
+            member_ids[member] = placeholder["id"]
 
     event = await event_service.save_event(
         db,

@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Union
 from datetime import datetime
 
 
@@ -82,10 +82,17 @@ class AdminModelUpdate(BaseModel):
 
 # ─── Events ─────────────────────────────────────────────────────────────
 
+#: A group member as sent by the client: an existing user's id, an email
+#: address, or ``{"name": ..., "email": ...}`` for someone being added by name
+#: (the email is optional — without one they are an uninvited placeholder).
+#: See event_service._resolve_users.
+MemberRef = Union[str, dict]
+
+
 class EventCreate(BaseModel):
     title: Optional[str] = Field(None, alias="eventName")
     description: str = ""
-    members: list[str] = Field(default_factory=list, alias="users")
+    members: list[MemberRef] = Field(default_factory=list, alias="users")
     currency: Optional[str] = None
     # {currency code: rate into this event's currency}, set by the members.
     fxRates: Optional[dict[str, float]] = None
@@ -101,13 +108,18 @@ class EventUpdate(BaseModel):
     id: str
     title: Optional[str] = Field(None, alias="eventName")
     description: str = ""
-    members: list[str] = Field(default_factory=list, alias="users")
+    members: list[MemberRef] = Field(default_factory=list, alias="users")
     currency: Optional[str] = None
     fxRates: Optional[dict[str, float]] = None
     simplifyDebts: Optional[bool] = None
 
     class Config:
         populate_by_name = True
+
+
+class JoinGroupRequest(BaseModel):
+    #: Id of a placeholder member the joiner is identifying themselves as.
+    claimMemberId: str = ""
 
 
 # ─── Shares ─────────────────────────────────────────────────────────────

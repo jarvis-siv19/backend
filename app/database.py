@@ -25,6 +25,12 @@ async def _seed_database(db: AsyncIOMotorDatabase):
     await db.users.create_index([("firebaseUid", pymongo.ASCENDING)], unique=True, sparse=True)
     await db.users.create_index([("friendCode", pymongo.ASCENDING)], unique=True, sparse=True)
 
+    # Group invite links resolve by code on every visit, and two groups sharing
+    # a code would let an invitee land in the wrong one.
+    await db.event.create_index(
+        [("joinCode", pymongo.ASCENDING)], unique=True, sparse=True
+    )
+
     # Activity feed: every read is "entries visible to me, newest first".
     await db.audit_log.create_index(
         [("visibleTo", pymongo.ASCENDING), ("createdAt", pymongo.DESCENDING)]

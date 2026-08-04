@@ -142,11 +142,28 @@ async def find_or_create_user(
     if not is_first_user:
         if not invite_code:
             raise HTTPException(status_code=400, detail="Invite code is required for registration.")
-        # Validate invite code (friendCode)
+        # Validate invite code. Two kinds are accepted: another user's
+        # friendCode, and a group's join code — someone handed a group link is
+        # just as invited as someone handed a personal code, and without this
+        # they would hit "invite code required" with no way to get one.
+        #
+        # Group links normally carry the sharer's personal code too, so this
+        # fallback is for links that lost their query string. Either way
+        # `invitedBy` ends up holding a *person's* code: attribution falls back
+        # to whoever created the group, so the referral chain never breaks.
         inviter = await db.users.find_one({"friendCode": invite_code})
-        if not inviter:
-            raise HTTPException(status_code=400, detail="Invalid invite code.")
-        invited_by = invite_code
+        if inviter:
+            invited_by = invite_code
+        else:
+            group = await db.event.find_one(
+                {"joinCode": invite_code.strip().upper()}, {"createdBy": 1}
+            )
+            if not group:
+                raise HTTPException(status_code=400, detail="Invalid invite code.")
+            creator = await db.users.find_one(
+                {"_id": group.get("createdBy")}, {"friendCode": 1}
+            )
+            invited_by = (creator or {}).get("friendCode") or invite_code
 
     friend_code = generate_friend_code(8)
 
@@ -249,6 +266,56 @@ async def create_phantom_user(
     doc["_id"] = result.inserted_id
     # Same shape as the existing-user branch above; callers only need the id
     # and enough to address an invite email.
+    serialized = public_user(doc)
+    serialized["wasCreated"] = True
+    return serialized
+
+
+async def create_placeholder_user(
+    db: AsyncIOMotorDatabase, name: str, created_by: str | None = None
+) -> dict:
+    """Create a name-only placeholder member — someone with no email yet.
+
+    The difference from :func:`create_phantom_user` is that there is no address
+    to match on later, so this always creates a fresh document instead of
+    finding one: two people called "Sam" in two different groups are two
+    different placeholders. They are claimed explicitly instead, by whoever
+    joins the group and says "that one is me" (event_service.join_event_by_code).
+
+    ``claimable`` marks that: an email-backed phantom belongs to that address
+    and must never be claimable by an arbitrary link holder.
+    """
+    import uuid as _uuid
+
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Member name is required")
+
+    friend_code = generate_friend_code(8)
+    while await db.users.find_one({"friendCode": friend_code}):
+        friend_code = generate_friend_code(8)
+
+    now = datetime.now(timezone.utc)
+    doc = {
+        "firebaseUid": f"phantom_{_uuid.uuid4().hex}",
+        # Empty, not absent: the email-claim branch of find_or_create_user
+        # searches by a real address, which never matches "".
+        "email": "",
+        "name": name,
+        "friendCode": friend_code,
+        "upiId": "",
+        "defaultCurrency": settings.DEFAULT_CURRENCY,
+        "friends": [],
+        "role": "user",
+        "isPhantom": True,
+        "claimable": True,
+        "createdBy": ObjectId(created_by) if created_by else None,
+        "invitedBy": None,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = await db.users.insert_one(doc)
+    doc["_id"] = result.inserted_id
     serialized = public_user(doc)
     serialized["wasCreated"] = True
     return serialized

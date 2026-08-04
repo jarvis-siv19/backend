@@ -1,3 +1,4 @@
+import secrets
 from datetime import datetime, timezone
 from bson import ObjectId
 from fastapi import HTTPException
@@ -214,6 +215,10 @@ async def get_event_by_id(db: AsyncIOMotorDatabase, event_id: str) -> dict | Non
                     "id": str(user["_id"]),
                     "name": user.get("name", ""),
                     "email": user.get("email", ""),
+                    # Lets the editor show "not invited yet" instead of an
+                    # empty email, and keeps the chip removable by id.
+                    "isPlaceholder": bool(user.get("claimable"))
+                    and not user.get("email"),
                 }
             )
 
@@ -411,11 +416,17 @@ async def _resolve_users(
 ) -> tuple[list, list]:
     """Resolve user references to ObjectIds.
 
-    References may be ObjectId strings or email addresses. An email that isn't a
-    registered user creates a phantom account (find-or-create) so the person is
-    actually added to the event instead of being silently dropped; newly
-    created phantoms are returned so the caller can email them an invite.
-    Returns ``(user_ids, newly_invited_phantoms)``.
+    A reference is one of:
+
+    * an ObjectId string — an existing user (a friend, or a current member);
+    * an email address — find-or-create a phantom account so the person is
+      actually added instead of being silently dropped, and they get an invite;
+    * ``{"name": "Sam"}`` (optionally with ``"email"``) — a name-only
+      placeholder for someone who is not being invited yet. Whoever joins the
+      group by link can later claim that slot as themselves.
+
+    Returns ``(user_ids, newly_invited_phantoms)``; only the ones with an email
+    are worth mailing, so placeholders never appear in the second list.
 
     ``actor_id`` bounds who may be added: the actor's existing friends, plus
     people who are not registered yet (a fresh phantom the actor is inviting),
@@ -439,7 +450,42 @@ async def _resolve_users(
     rejected: list = []
     for ref in user_refs:
         if isinstance(ref, dict):
-            ref = ref.get("id", ref.get("_id", ""))
+            explicit_id = ref.get("id") or ref.get("_id") or ""
+            if not explicit_id:
+                # New member given by name (and maybe an email). With an email
+                # this is the ordinary invite path; without one it is a
+                # placeholder nobody is being emailed about.
+                email = str(ref.get("email") or "").strip()
+                name = str(ref.get("name") or "").strip()
+                if email:
+                    phantom = await user_service.create_phantom_user(
+                        db, email=email, name=name
+                    )
+                    try:
+                        oid = ObjectId(phantom["id"])
+                    except Exception:
+                        continue
+                    if (
+                        not phantom.get("wasCreated")
+                        and str(oid) not in allowed
+                        and not await _is_phantom(db, oid)
+                    ):
+                        rejected.append(email)
+                        continue
+                    if oid not in user_ids:
+                        user_ids.append(oid)
+                    if phantom.get("wasCreated"):
+                        invited.append(phantom)
+                elif name:
+                    placeholder = await user_service.create_placeholder_user(
+                        db, name=name, created_by=actor_id
+                    )
+                    try:
+                        user_ids.append(ObjectId(placeholder["id"]))
+                    except Exception:
+                        pass
+                continue
+            ref = explicit_id
         ref = str(ref).strip()
         if not ref:
             continue
@@ -490,7 +536,9 @@ async def _send_member_invites(
         return
     from app.services import email_service
 
-    inviter = await db.users.find_one({"_id": ObjectId(inviter_id)}, {"name": 1})
+    inviter = await db.users.find_one(
+        {"_id": ObjectId(inviter_id)}, {"name": 1, "friendCode": 1}
+    )
     inviter_name = (inviter or {}).get("name", "")
     for phantom in invited:
         email = phantom.get("email")
@@ -500,6 +548,7 @@ async def _send_member_invites(
                     to_email=email,
                     to_name=phantom.get("name", ""),
                     inviter_name=inviter_name,
+                    invite_code=(inviter or {}).get("friendCode", ""),
                 )
             )
 
@@ -519,6 +568,280 @@ async def _auto_add_friend(db: AsyncIOMotorDatabase, user_id: str, friend_id: st
         {"_id": friend_oid, "friends": {"$ne": user_oid}},
         {"$addToSet": {"friends": user_oid}},
     )
+
+
+#: Join-code alphabet. Excludes the characters people confuse when retyping a
+#: code read off a screen (0/O, 1/I/L) — the code travels in a link, but it is
+#: also short enough that someone will inevitably type it by hand.
+_JOIN_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+_JOIN_CODE_LENGTH = 10
+
+
+def generate_join_code(length: int = _JOIN_CODE_LENGTH) -> str:
+    """Generate a group join code.
+
+    `secrets`, not `random`: possessing this code is what authorises joining a
+    group, so it has to be unguessable — same reasoning as
+    user_service.generate_friend_code.
+    """
+    return "".join(secrets.choice(_JOIN_CODE_ALPHABET) for _ in range(length))
+
+
+async def _new_join_code(db: AsyncIOMotorDatabase) -> str:
+    code = generate_join_code()
+    while await db.event.find_one({"joinCode": code}, {"_id": 1}):
+        code = generate_join_code()
+    return code
+
+
+async def get_join_link(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str, rotate: bool = False
+) -> dict:
+    """Return the group's join code, creating (or rotating) it on demand.
+
+    Codes are created lazily so groups that never share a link never carry one.
+    Rotating invalidates every link already handed out, which is the only way
+    to undo an over-shared invite.
+    """
+    event = await db.event.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    code = event.get("joinCode")
+    if rotate or not code:
+        code = await _new_join_code(db)
+        await db.event.update_one(
+            {"_id": event["_id"]},
+            {
+                "$set": {
+                    "joinCode": code,
+                    "joinCodeUpdatedAt": datetime.now(timezone.utc),
+                    "updatedBy": ObjectId(user_id),
+                }
+            },
+        )
+    return {"joinCode": code, "eventName": event.get("eventName", "")}
+
+
+async def disable_join_link(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str
+) -> dict:
+    """Turn off link joining for a group. Existing links stop working."""
+    result = await db.event.update_one(
+        {"_id": ObjectId(event_id)},
+        {
+            "$unset": {"joinCode": "", "joinCodeUpdatedAt": ""},
+            "$set": {"updatedBy": ObjectId(user_id)},
+        },
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"success": True}
+
+
+async def preview_join_code(db: AsyncIOMotorDatabase, code: str) -> dict:
+    """What an invitee sees before signing in: just enough to decide to join.
+
+    Deliberately public and deliberately thin — the group's name, size and
+    currency. No member list, no balances, no expenses. The code is the only
+    credential, so anything richer here would leak to whoever the link reached.
+    """
+    event = await db.event.find_one(
+        {"joinCode": (code or "").strip().upper()},
+        {"eventName": 1, "users": 1, "currency": 1},
+    )
+    if not event:
+        raise HTTPException(status_code=404, detail="This invite link is not valid")
+    return {
+        "eventId": str(event["_id"]),
+        "eventName": event.get("eventName", ""),
+        "memberCount": len(event.get("users", [])),
+        "currency": event.get("currency"),
+    }
+
+
+async def _is_claimable_placeholder(db: AsyncIOMotorDatabase, oid: ObjectId) -> bool:
+    """True for a name-only slot anyone joining by link may claim.
+
+    An email-backed phantom is excluded: it stands for a specific address, and
+    letting whoever holds the link claim it would hand them that person's
+    shares and balances.
+    """
+    user = await db.users.find_one(
+        {"_id": oid}, {"claimable": 1, "email": 1, "firebaseUid": 1, "isPhantom": 1}
+    )
+    if not user:
+        return False
+    if user.get("email"):
+        return False
+    unregistered = bool(user.get("isPhantom")) or str(
+        user.get("firebaseUid", "")
+    ).startswith("phantom_")
+    return bool(user.get("claimable")) and unregistered
+
+
+async def get_claimable_members(db: AsyncIOMotorDatabase, code: str) -> dict:
+    """The unclaimed name-only slots in the group a join code points at.
+
+    Authenticated callers only (see the router): this is the group's member
+    names, which the public preview deliberately withholds.
+    """
+    event = await db.event.find_one(
+        {"joinCode": (code or "").strip().upper()}, {"eventName": 1, "users": 1}
+    )
+    if not event:
+        raise HTTPException(status_code=404, detail="This invite link is not valid")
+
+    members = []
+    for member in event.get("users", []):
+        if await _is_claimable_placeholder(db, member):
+            user = await db.users.find_one({"_id": member}, {"name": 1})
+            members.append({"id": str(member), "name": (user or {}).get("name", "")})
+    return {"eventName": event.get("eventName", ""), "members": members}
+
+
+async def merge_placeholder_into_user(
+    db: AsyncIOMotorDatabase, placeholder_id: ObjectId, user_id: ObjectId
+) -> None:
+    """Rewrite every reference to a placeholder to point at a real account.
+
+    The merge is global rather than per-group: a placeholder can have been
+    added to more than one group (members auto-friend each other, so it shows
+    up in their friend lists too), and leaving half the references behind would
+    split one person's balances across two identities.
+    """
+    # Expense shares: the placeholder's amounts become the real user's. An
+    # expense that already names both would end up with two rows for the same
+    # person, so those are merged rather than rewritten.
+    expenses = await db.expense.find(
+        {
+            "$or": [
+                {"shares.userId": placeholder_id},
+                {"payShares.userId": placeholder_id},
+            ]
+        }
+    ).to_list(length=None)
+    for expense in expenses:
+        update = {}
+        for field in ("shares", "payShares"):
+            rows = expense.get(field, [])
+            if not any(r.get("userId") == placeholder_id for r in rows):
+                continue
+            merged: list = []
+            for row in rows:
+                if row.get("userId") == placeholder_id:
+                    row = {**row, "userId": user_id}
+                existing = next(
+                    (m for m in merged if m.get("userId") == row.get("userId")), None
+                )
+                if existing:
+                    existing["amount"] = float(existing.get("amount", 0)) + float(
+                        row.get("amount", 0)
+                    )
+                else:
+                    merged.append(dict(row))
+            update[field] = merged
+        if update:
+            await db.expense.update_one({"_id": expense["_id"]}, {"$set": update})
+
+    # Group membership, friend lists and pending settle-ups.
+    await db.event.update_many(
+        {"users": placeholder_id}, {"$addToSet": {"users": user_id}}
+    )
+    await db.event.update_many(
+        {"users": placeholder_id}, {"$pull": {"users": placeholder_id}}
+    )
+    await db.users.update_many(
+        {"friends": placeholder_id}, {"$addToSet": {"friends": user_id}}
+    )
+    await db.users.update_many(
+        {"friends": placeholder_id}, {"$pull": {"friends": placeholder_id}}
+    )
+    # Nobody can be their own friend — the claimer was already a member of some
+    # of those groups, so this is reachable.
+    await db.users.update_one({"_id": user_id}, {"$pull": {"friends": user_id}})
+    for field in ("payerId", "payeeId"):
+        await db.settlement_request.update_many(
+            {field: placeholder_id}, {"$set": {field: user_id}}
+        )
+
+    await db.users.delete_one({"_id": placeholder_id})
+
+
+async def join_event_by_code(
+    db: AsyncIOMotorDatabase, code: str, user_id: str, claim_member_id: str = ""
+) -> dict:
+    """Add the caller to the group the code belongs to.
+
+    This is the one path that adds a member without the actor being an existing
+    member's friend: consent runs the other way round — a member handed out the
+    link, and the joiner chose to use it. As with any other membership change,
+    everyone involved becomes friends so later expenses can be split.
+
+    ``claim_member_id`` says "I am this placeholder": their existing shares in
+    the group transfer to the joiner instead of the joiner starting at zero.
+    """
+    event = await db.event.find_one({"joinCode": (code or "").strip().upper()})
+    if not event:
+        raise HTTPException(status_code=404, detail="This invite link is not valid")
+
+    user_oid = ObjectId(user_id)
+    members = event.get("users", [])
+
+    if claim_member_id:
+        try:
+            placeholder_oid = ObjectId(claim_member_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid member selected")
+        if placeholder_oid not in members:
+            raise HTTPException(
+                status_code=400, detail="That member is not in this group"
+            )
+        if not await _is_claimable_placeholder(db, placeholder_oid):
+            raise HTTPException(
+                status_code=400, detail="That member has already been claimed"
+            )
+        await merge_placeholder_into_user(db, placeholder_oid, user_oid)
+        event = await db.event.find_one({"_id": event["_id"]})
+        members = event.get("users", [])
+
+    # Claiming a placeholder already put the joiner in `users`, so this is only
+    # false when they arrived without claiming anyone.
+    already_member = user_oid in members
+    if not already_member:
+        await db.event.update_one(
+            {"_id": event["_id"]},
+            {
+                "$addToSet": {"users": user_oid},
+                "$set": {"updatedBy": user_oid, "updatedAt": datetime.now(timezone.utc)},
+            },
+        )
+        for member in members:
+            if str(member) != user_id:
+                await _auto_add_friend(db, user_id, str(member))
+
+    if not already_member or claim_member_id:
+        updated = await db.event.find_one({"_id": event["_id"]})
+        await audit_service.record(
+            db,
+            entity="event",
+            entity_id=str(event["_id"]),
+            action="update",
+            actor_id=user_id,
+            audience=list((updated or {}).get("users", [])),
+            summary=f"the group {event.get('eventName', '')}",
+            before=audit_service.snapshot(event),
+            after=audit_service.snapshot(updated),
+        )
+
+    return {
+        "eventId": str(event["_id"]),
+        "eventName": event.get("eventName", ""),
+        # From the joiner's point of view "already a member" means they had
+        # nothing to do — claiming a slot is very much something.
+        "alreadyMember": already_member and not claim_member_id,
+        "claimed": bool(claim_member_id),
+    }
 
 
 async def delete_event(

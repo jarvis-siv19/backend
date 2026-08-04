@@ -79,11 +79,13 @@ async def create_phantom_user(
         db, email=request.email, name=request.name
     )
     if user.pop("wasCreated", False):
+        inviter = await user_service.get_user_account(db, current_user["uid"])
         email_service.send_in_background(
             email_service.send_invite_email(
                 to_email=request.email,
                 to_name=user.get("name", ""),
                 inviter_name=current_user.get("name", ""),
+                invite_code=(inviter or {}).get("friendCode", ""),
             )
         )
     return user

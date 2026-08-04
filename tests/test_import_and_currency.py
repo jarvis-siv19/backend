@@ -79,6 +79,38 @@ def test_import_splitwise_end_to_end(client):
     assert dues["currency"] == "INR"
 
 
+def test_import_without_mapping_creates_placeholders(client):
+    """An import can run before anyone has been identified: unmapped CSV names
+    become name-only placeholders, claimable later via the group's invite link."""
+    account = client.get("/db/user/account").json()
+    response = client.post(
+        "/db/import/splitwise",
+        files={"file": ("unmapped_export.csv", SAMPLE_CSV, "text/csv")},
+        data={
+            "eventName": "Unmapped Trip",
+            "currency": "INR",
+            # Only the importer is identified; the other three are left blank.
+            "mapping": json.dumps({"Sivaganesh B": {"userId": account["id"]}}),
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["imported"] == 4
+    assert result["skipped"] == []
+
+    event = client.get(f"/db/event/{result['eventId']}").json()
+    placeholders = [u for u in event["users"] if u["isPlaceholder"]]
+    assert sorted(u["name"] for u in placeholders) == [
+        "Adithya Prakash MIT",
+        "Saroja",
+        "Sivassri Suresh",
+    ]
+
+    # Balances still reconstruct exactly as with mapped members.
+    dues = client.get(f"/db/user/event/{result['eventId']}/dues").json()
+    assert abs((dues["totalOwed"] - dues["totalDebt"]) - 234.00) < 0.05
+
+
 def test_expense_currency_conversion(client):
     # Seed an FX rate directly into Mongo (the fallback source) and confirm a
     # USD expense in an INR event is stored converted at that rate.

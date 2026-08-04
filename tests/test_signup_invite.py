@@ -83,3 +83,54 @@ async def test_second_user_signup_requires_and_accepts_invite_code(
         await db.users.delete_one({"firebaseUid": SECOND_UID})
     finally:
         mongo.close()
+
+
+THIRD_UID = "third_user_uid_789"
+THIRD_EMAIL = "third@example.com"
+
+
+@pytest.fixture
+def third_user_client():
+    async def mock_identity():
+        return {"uid": THIRD_UID, "email": THIRD_EMAIL, "name": "Third User"}
+
+    app.dependency_overrides[get_verified_identity] = mock_identity
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.pop(get_verified_identity, None)
+
+
+@pytest.mark.asyncio
+async def test_group_join_code_works_as_a_signup_invite(third_user_client):
+    """A group link whose personal invite code got lost still registers the
+    visitor — and the referral is credited to the group's creator, so
+    `invitedBy` always names a person rather than a group."""
+    mongo = AsyncIOMotorClient(settings.MONGODB_URI)
+    db = mongo[settings.DB_NAME]
+    try:
+        owner = await db.users.find_one({"firebaseUid": MOCK_USER_UID})
+        await db.event.insert_one(
+            {
+                "eventName": "Signup By Link",
+                "users": [owner["_id"]],
+                "expenses": [],
+                "createdBy": owner["_id"],
+                "joinCode": "GRPCODE123",
+            }
+        )
+
+        response = third_user_client.post(
+            "/db/signup",
+            json={
+                "email": THIRD_EMAIL,
+                "name": "Third User",
+                "inviteCode": "GRPCODE123",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["invitedBy"] == owner["friendCode"]
+
+        await db.users.delete_one({"firebaseUid": THIRD_UID})
+        await db.event.delete_one({"joinCode": "GRPCODE123"})
+    finally:
+        mongo.close()
