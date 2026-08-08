@@ -845,22 +845,57 @@ async def join_event_by_code(
 
 
 async def delete_event(
-    db: AsyncIOMotorDatabase, event_id: str, user_id: str | None = None
+    db: AsyncIOMotorDatabase,
+    event_id: str,
+    user_id: str | None = None,
+    force: bool = False,
 ) -> dict:
-    """Delete an event and its expenses (if no unsettled dues)."""
+    """Delete an event and its expenses, unless money is still owed inside it.
+
+    A refusal is a real error. This used to answer HTTP 200 with
+    ``success: "false"`` — a *string*, and a truthy one — so every caller read
+    it as success: the app announced the deletion and navigated away from a
+    group that was still there.
+
+    ``force`` skips the balance check, and is only for the group's creator.
+    Deleting a group with live debts destroys the record of who owed whom, so
+    it needs someone who can be said to own that decision; it exists mainly so
+    a throwaway test group is not immortal.
+    """
     event = await db.event.find_one({"_id": ObjectId(event_id)})
     if not event:
-        return {"message": "Event not found", "success": "false"}
+        raise HTTPException(status_code=404, detail="Event not found")
 
-    # Check for unsettled dues
-    dues = await get_event_dues(db, event_id)
-    if dues and "eventDues" in dues:
-        for due in dues["eventDues"]:
-            if due.get("creditorDetails") and len(due["creditorDetails"]) > 0:
-                return {
-                    "message": "Cannot delete event. There are unsettled dues.",
-                    "success": "false",
-                }
+    if force and str(event.get("createdBy")) != str(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the person who created this group can force-delete it.",
+        )
+
+    if not force:
+        outstanding = []
+        dues = await get_event_dues(db, event_id)
+        for due in (dues or {}).get("eventDues", []):
+            for creditor in due.get("creditorDetails", []) or []:
+                outstanding.append(
+                    {
+                        "debtor": due.get("debtor", "Someone"),
+                        "creditor": creditor.get("name", "someone"),
+                        "amount": creditor.get("amount", 0),
+                    }
+                )
+        if outstanding:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "event_has_unsettled_dues",
+                    "message": "This group still has unsettled balances.",
+                    # Naming them turns "it failed" into something actionable.
+                    "outstanding": outstanding,
+                    "expenseCount": len(event.get("expenses", [])),
+                    "canForce": str(event.get("createdBy")) == str(user_id),
+                },
+            )
 
     # Snapshot the expenses before deleting them: undoing the group deletion
     # has to bring its history back, not just an empty group.
@@ -1044,6 +1079,103 @@ async def get_event_dues(db: AsyncIOMotorDatabase, event_id: str) -> dict:
         "eventDues": event_dues,
         "currency": event.get("currency", settings.DEFAULT_CURRENCY),
         "simplifyDebts": simplify,
+    }
+
+
+async def get_event_summary(
+    db: AsyncIOMotorDatabase, event_id: str, user_id: str
+) -> dict:
+    """Per-member spend/paid totals for an event, plus the group total.
+
+    Three different questions, which a single "balance" number conflates:
+
+    * ``paid`` — what someone put on the table;
+    * ``spend`` — their own share of the bills, i.e. what the group cost them;
+    * ``net`` — the difference, positive when the group still owes them.
+
+    Settling up is tracked separately and kept out of ``spend``, so squaring a
+    debt moves ``net`` towards zero without ever looking like the group
+    consumed something. Dues answer "who pays whom"; this answers "where did
+    the money go", and the two are not the same question.
+    """
+    event = await db.event.find_one({"_id": ObjectId(event_id)})
+    if not event:
+        raise HTTPException(status_code=404, detail="Event not found")
+
+    expense_ids = [
+        ref if isinstance(ref, ObjectId) else ObjectId(ref)
+        for ref in event.get("expenses", [])
+    ]
+    expenses = await db.expense.find({"_id": {"$in": expense_ids}}).to_list(
+        length=None
+    )
+
+    paid: dict[str, float] = {}
+    spend: dict[str, float] = {}
+    # Money moved between members to square up. Positive = paid out.
+    settled: dict[str, float] = {}
+    group_total = 0.0
+
+    for expense in expenses:
+        is_settlement = expense.get("type") == "settle"
+
+        for pay_share in expense.get("payShares", []):
+            member_id = str(pay_share["userId"])
+            amount = float(pay_share.get("amount", 0))
+            if is_settlement:
+                settled[member_id] = settled.get(member_id, 0.0) + amount
+            else:
+                paid[member_id] = paid.get(member_id, 0.0) + amount
+                group_total += amount
+
+        for share in expense.get("shares", []):
+            member_id = str(share["userId"])
+            amount = float(share.get("amount", 0))
+            if is_settlement:
+                # The receiving side of a settlement.
+                settled[member_id] = settled.get(member_id, 0.0) - amount
+            else:
+                spend[member_id] = spend.get(member_id, 0.0) + amount
+
+    member_oids = [
+        ref if isinstance(ref, ObjectId) else ObjectId(ref)
+        for ref in event.get("users", [])
+    ]
+    # One query for every name, rather than one per member.
+    docs = await db.users.find(
+        {"_id": {"$in": member_oids}}, {"name": 1}
+    ).to_list(length=None)
+    names = {str(d["_id"]): d.get("name", "Unknown") for d in docs}
+
+    members = []
+    for oid in member_oids:
+        member_id = str(oid)
+        member_paid = round(paid.get(member_id, 0.0), 2)
+        member_spend = round(spend.get(member_id, 0.0), 2)
+        member_settled = round(settled.get(member_id, 0.0), 2)
+        members.append(
+            {
+                "id": member_id,
+                "name": names.get(member_id, "Unknown"),
+                "isYou": member_id == str(user_id),
+                "paid": member_paid,
+                "spend": member_spend,
+                "settled": member_settled,
+                # Positive when the group still owes them. Settling up moves
+                # this towards zero without touching what anyone spent.
+                "net": round(member_paid - member_spend + member_settled, 2),
+            }
+        )
+
+    members.sort(key=lambda m: m["spend"], reverse=True)
+
+    return {
+        "eventId": str(event["_id"]),
+        "eventName": event.get("eventName", ""),
+        "currency": event.get("currency", settings.DEFAULT_CURRENCY),
+        "groupTotal": round(group_total, 2),
+        "expenseCount": sum(1 for e in expenses if e.get("type") != "settle"),
+        "members": members,
     }
 
 
