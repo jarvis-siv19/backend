@@ -97,6 +97,8 @@ Once running, visit:
 | Events | GET | `/db/event/:id/expenses` | ✅ |
 | Events | GET | `/db/user/event/:id/dues` | ✅ |
 | Expenses | POST | `/db/expense` | ✅ |
+| Expenses | GET | `/db/expense/category-suggestion` | ✅ |
+| Expenses | GET | `/db/categories` | ❌ |
 | Expenses | GET | `/db/expense/:id` | ✅ |
 | Expenses | PUT | `/db/expense/:id` | ✅ |
 | Expenses | DELETE | `/db/expense/:id` | ✅ |
@@ -152,6 +154,37 @@ before/after document snapshot, visible to everyone the change affected.
 `POST /db/activity/:id/undo` restores that snapshot. Undo is refused if the
 document changed afterwards (409), if it was already undone, or outside the
 7-day window.
+
+### Categories
+
+`category_service.CATEGORIES` is the single category vocabulary — the Flutter
+pickers and the receipt-scanner prompt all read from it, and `normalize()` folds
+older spellings, Splitwise's names and scanner output onto it on every write.
+
+Suggestions (`GET /db/expense/category-suggestion?name=`) come from three
+places, best first:
+
+1. **You** — what this person filed a title like this under before.
+2. **Everyone** — the same, aggregated. This is the part that grows: saving or
+   correcting an expense increments a tally in `category_hints`, keyed by the
+   whole title (weighted ×3) and by each meaningful word in it.
+3. **Keywords** — a static seed table, so a fresh install still guesses well.
+
+A correction outvotes the old answer over time rather than needing to erase it,
+and settlements never teach the table. No model is involved; it is counting.
+
+### Importing
+
+`POST /db/import/splitwise` creates a group from a Splitwise export. Members
+that are not mapped to an account or an email become name-only placeholders, so
+the import runs without identifying everyone up front.
+
+Passing `eventId` instead of `eventName` imports into an existing group and adds
+**only the rows that are not already there** — each expense stores an
+`importKey` fingerprint of its source row, so re-exporting after a trip tops the
+group up rather than duplicating it. Rows imported before fingerprints existed
+are matched on a looser key (date, description, cost, currency). The preview
+endpoint reports `newRowCount` / `duplicateRowCount` up front.
 
 ### Credit-card reminders
 
