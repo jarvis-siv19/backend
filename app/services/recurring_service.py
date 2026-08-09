@@ -25,9 +25,12 @@ posts*, which is what people actually mean by "we split Netflix" when someone
 joins in March.
 """
 
+import asyncio
 import calendar
 import logging
+from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
+from typing import AsyncIterator
 
 from bson import ObjectId
 from fastapi import HTTPException
@@ -321,6 +324,44 @@ async def _assert_member(db: AsyncIOMotorDatabase, user_id: str, event_id: str) 
 # ─── Posting ────────────────────────────────────────────────────────────
 
 
+#: One lock per schedule, serialising passes *within this process*, with a count
+#: of the passes holding or waiting on each so it can be dropped when idle.
+_schedule_locks: dict[str, asyncio.Lock] = {}
+_schedule_lock_users: dict[str, int] = {}
+
+
+@asynccontextmanager
+async def _exclusive(schedule_id: ObjectId) -> AsyncIterator[None]:
+    """Hold this schedule for the length of one pass.
+
+    The unique index on ``recurring_run`` is what makes posting safe across
+    instances, but it only makes the loser *skip*: it returns immediately while
+    the winner is still creating the expense. Two passes share this process —
+    the hourly loop, and the user's own request — so without this, creating a
+    subscription could answer "nothing was due" while the loop was still
+    mid-post, and the user would be shown a subscription that had not been
+    charged yet.
+
+    The entry is dropped once nobody holds or wants it, which both bounds the
+    dict and keeps a lock from outliving the event loop it was first awaited on.
+    """
+    key = str(schedule_id)
+    lock = _schedule_locks.get(key)
+    if lock is None:
+        lock = _schedule_locks[key] = asyncio.Lock()
+    _schedule_lock_users[key] = _schedule_lock_users.get(key, 0) + 1
+    try:
+        async with lock:
+            yield
+    finally:
+        # Counted rather than asking the lock, because a just-released lock
+        # reports itself unlocked while a waiter is still queued behind it.
+        _schedule_lock_users[key] -= 1
+        if not _schedule_lock_users[key]:
+            del _schedule_lock_users[key]
+            del _schedule_locks[key]
+
+
 async def _claim(
     db: AsyncIOMotorDatabase, schedule_id: ObjectId, occurrence: date
 ) -> bool:
@@ -340,6 +381,19 @@ async def _claim(
         return True
     except DuplicateKeyError:
         return False
+
+
+async def _release(
+    db: AsyncIOMotorDatabase, schedule_id: ObjectId, occurrence: date
+) -> None:
+    """Give back a claim whose expense was never created.
+
+    Without this the reservation outlives the failure, and every later pass
+    skips the occurrence as already posted — losing it for good.
+    """
+    await db.recurring_run.delete_one(
+        {"recurringId": schedule_id, "occurrenceDate": occurrence.isoformat()}
+    )
 
 
 async def _shares_for(
@@ -408,6 +462,20 @@ async def post_due(
 async def _post_one(
     db: AsyncIOMotorDatabase, expense_service, schedule: dict, today: date
 ) -> int:
+    # One pass over a schedule at a time in this process. See _schedule_locks:
+    # the caller's guarantee is that when it returns, what was due has posted.
+    async with _exclusive(schedule["_id"]):
+        # Re-read: a pass we just queued behind may have posted some of these
+        # and moved nextDueDate on, and the copy we were handed predates it.
+        current = await db.recurring_expense.find_one({"_id": schedule["_id"]})
+        if not current:
+            return 0
+        return await _post_one_locked(db, expense_service, current, today)
+
+
+async def _post_one_locked(
+    db: AsyncIOMotorDatabase, expense_service, schedule: dict, today: date
+) -> int:
     next_due = _parse_date(schedule.get("nextDueDate"))
     if not next_due:
         return 0
@@ -429,12 +497,15 @@ async def _post_one(
     cursor = next_due
 
     for occurrence in occurrences:
-        cursor = advance(
+        following = advance(
             occurrence,
             schedule.get("frequency", "monthly"),
             int(schedule.get("anchorDay") or occurrence.day),
         )
         if not await _claim(db, schedule["_id"], occurrence):
+            # Another instance owns this one and will post it. Ours is done
+            # with it either way, so move past it.
+            cursor = following
             continue
 
         shares, pay_shares = await _shares_for(db, schedule, amount)
@@ -455,18 +526,28 @@ async def _post_one(
         if schedule.get("eventId"):
             payload["eventId"] = str(schedule["eventId"])
 
-        result = await expense_service.create_expense(db, owner_id, payload)
+        # Both failure paths below leave `cursor` on this occurrence, not past
+        # it. Releasing the claim only earns a retry if nextDueDate still points
+        # at the occurrence to retry — advancing it too would skip the very
+        # occurrence the release was meant to save.
+        try:
+            result = await expense_service.create_expense(db, owner_id, payload)
+        except Exception as e:
+            await _release(db, schedule["_id"], occurrence)
+            logger.error(
+                "Recurring schedule %s: occurrence %s failed: %s",
+                schedule["_id"],
+                occurrence,
+                e,
+            )
+            break
+
         created = (result or {}).get("data") or {}
         if not created.get("_id") and not created.get("id"):
             # create_expense refused it. Release the claim so a fixed schedule
             # can post this occurrence on a later pass instead of it being
             # silently lost forever.
-            await db.recurring_run.delete_one(
-                {
-                    "recurringId": schedule["_id"],
-                    "occurrenceDate": occurrence.isoformat(),
-                }
-            )
+            await _release(db, schedule["_id"], occurrence)
             logger.error(
                 "Recurring schedule %s: occurrence %s rejected: %s",
                 schedule["_id"],
@@ -493,6 +574,7 @@ async def _post_one(
             {"$set": {"expenseId": ObjectId(expense_id)}},
         )
         posted += 1
+        cursor = following
 
     finished = bool(end and cursor > end)
     await db.recurring_expense.update_one(
