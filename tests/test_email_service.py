@@ -13,7 +13,7 @@ class TestGating:
     @pytest.fixture(autouse=True)
     def reset_cache(self):
         from app.services import site_settings
-        site_settings._cache.clear()
+        site_settings.invalidate_cache()
         
     def test_disabled_without_token(self, monkeypatch):
         monkeypatch.setattr(email_service.settings, "ZEPTOMAIL_ENABLED", True)
