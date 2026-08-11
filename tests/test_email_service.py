@@ -10,6 +10,11 @@ from app.services import email_service
 
 
 class TestGating:
+    @pytest.fixture(autouse=True)
+    def reset_cache(self):
+        from app.services import site_settings
+        site_settings._cache.clear()
+        
     def test_disabled_without_token(self, monkeypatch):
         monkeypatch.setattr(email_service.settings, "ZEPTOMAIL_ENABLED", True)
         monkeypatch.setattr(email_service.settings, "ZEPTOMAIL_TOKEN", "")
