@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     ZEPTOMAIL_FROM_ADDRESS: str = "noreply@splitllm.com"
     ZEPTOMAIL_FROM_NAME: str = "SplitLLM"
 
+    # Zoho Mail (SMTP alternative to ZeptoMail)
+    ZOHO_MAIL_PASSWORD: str = ""
+
     # Public URL of the web app (used in email links)
     APP_BASE_URL: str = "https://splitllm.com"
 

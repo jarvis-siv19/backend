@@ -201,6 +201,28 @@ async def find_or_create_user(
     invited_by_user_id = None
     status = STATUS_ACTIVE
 
+    # ── Signup gating (admin-controlled) ────────────────────────────────
+    # The first user (admin bootstrap) always passes. After that, the
+    # admin can disable signups or cap the number of registrations.
+    if not is_first_user:
+        from app.services.site_settings import get_site_settings
+        ss = await get_site_settings(db)
+        if not ss.get("signupsEnabled", True):
+            raise HTTPException(
+                status_code=403,
+                detail="New registrations are currently disabled by the administrator.",
+            )
+        max_limit = ss.get("maxSignupLimit", 0)
+        if max_limit > 0:
+            real_count = await db.users.count_documents(
+                {"isPhantom": {"$ne": True}, "isDeleted": {"$ne": True}}
+            )
+            if real_count >= max_limit:
+                raise HTTPException(
+                    status_code=403,
+                    detail="The maximum number of registered users has been reached. New sign-ups are temporarily disabled.",
+                )
+
     if not is_first_user and not invite_code:
         # A code that was never supplied is recoverable — the account is parked
         # as PENDING and the app walks them through redeeming one. A code that

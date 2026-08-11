@@ -255,3 +255,33 @@ async def set_app_version(
         {"_id": "app_version"}, {"$set": filtered}, upsert=True
     )
     return await get_version_info(db)
+
+
+@router.get("/settings")
+async def get_settings(
+    admin_user: dict = Depends(get_admin_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Get current site settings (Admin only)."""
+    from app.services.site_settings import get_site_settings
+
+    ss = await get_site_settings(db)
+
+    # Include current user count for the admin UI.
+    user_count = await db.users.count_documents(
+        {"isPhantom": {"$ne": True}, "isDeleted": {"$ne": True}}
+    )
+    ss["currentUserCount"] = user_count
+    return ss
+
+
+@router.put("/settings")
+async def put_settings(
+    update_data: dict = Body(...),
+    admin_user: dict = Depends(get_admin_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Update site settings (Admin only)."""
+    from app.services.site_settings import update_site_settings
+
+    return await update_site_settings(db, update_data)

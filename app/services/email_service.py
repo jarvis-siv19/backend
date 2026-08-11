@@ -23,7 +23,14 @@ TAGLINE = "Just another expense splitting app."
 
 
 def _enabled() -> bool:
-    return bool(settings.ZEPTOMAIL_ENABLED and settings.ZEPTOMAIL_TOKEN)
+    from app.services.site_settings import get_cached_settings
+    ss = get_cached_settings()
+    if not ss.get("emailEnabled", False):
+        return False
+    provider = ss.get("emailProvider", "zeptomail")
+    if provider == "zohomail":
+        return bool(settings.ZOHO_MAIL_PASSWORD)
+    return bool(settings.ZEPTOMAIL_TOKEN)
 
 
 def _symbol(currency: str) -> str:
@@ -52,11 +59,7 @@ def _render(title: str, body_html: str, cta_text: str, cta_url: str) -> str:
 """
 
 
-async def _send(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
-    if not _enabled():
-        logger.debug("ZeptoMail disabled; skipping email to %s (%s)", to_email, subject)
-        return False
-
+async def _send_zepto(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
     payload = {
         "from": {
             "address": settings.ZEPTOMAIL_FROM_ADDRESS,
@@ -86,6 +89,48 @@ async def _send(to_email: str, to_name: str, subject: str, html_body: str) -> bo
     except Exception as e:
         logger.error("ZeptoMail send error to %s: %s", to_email, e)
         return False
+
+def _sync_send_zoho(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
+    import smtplib
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg.set_content("Please view this email in an HTML-compatible email client.")
+    msg.add_alternative(html_body, subtype="html")
+
+    msg["Subject"] = subject
+    from_name = settings.ZEPTOMAIL_FROM_NAME
+    from_addr = settings.ZEPTOMAIL_FROM_ADDRESS
+    msg["From"] = f"{from_name} <{from_addr}>"
+    msg["To"] = f"{to_name} <{to_email}>" if to_name else to_email
+
+    try:
+        # Zoho Mail uses smtp.zoho.in for India and smtp.zoho.com globally.
+        # We check the ZeptoMail URL to guess the region, default to .com
+        host = "smtp.zoho.in" if ".in" in settings.ZEPTOMAIL_API_URL else "smtp.zoho.com"
+        server = smtplib.SMTP_SSL(host, 465, timeout=10)
+        server.login(from_addr, settings.ZOHO_MAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        return True
+    except Exception as e:
+        logger.error("Zoho SMTP send error to %s: %s", to_email, e)
+        return False
+
+async def _send_zoho(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
+    return await asyncio.to_thread(_sync_send_zoho, to_email, to_name, subject, html_body)
+
+async def _send(to_email: str, to_name: str, subject: str, html_body: str) -> bool:
+    if not _enabled():
+        logger.debug("Email disabled; skipping email to %s (%s)", to_email, subject)
+        return False
+
+    from app.services.site_settings import get_cached_settings
+    provider = get_cached_settings().get("emailProvider", "zeptomail")
+    
+    if provider == "zohomail":
+        return await _send_zoho(to_email, to_name, subject, html_body)
+    return await _send_zepto(to_email, to_name, subject, html_body)
 
 
 def send_in_background(coro) -> None:

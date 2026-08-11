@@ -30,6 +30,7 @@ from app.routers import (
     version_router,
 )
 from app.routers import recurring_router
+from app.routers import settings_router
 
 
 #: How often the reminder loop wakes. Hourly rather than daily so a container
@@ -65,6 +66,12 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle events."""
     # Startup
     await connect_to_mongo()
+    # Pre-warm the site-settings cache so sync readers have values immediately.
+    try:
+        from app.services.site_settings import get_site_settings
+        await get_site_settings(get_db())
+    except Exception:
+        pass  # DB may not be ready; cache will populate on first request.
     reminders = asyncio.create_task(_reminder_loop())
     print("SplitLLM Backend started")
     yield
@@ -160,6 +167,9 @@ app.include_router(recurring_router.router, prefix="/db", tags=["Recurring"])
 
 # Version route: /version (public; drives the in-app update prompt)
 app.include_router(version_router.router, tags=["Version"])
+
+# Public site settings: /db/settings/public (unauthenticated)
+app.include_router(settings_router.router, prefix="/db", tags=["Settings"])
 
 
 # ─── Health Check ───────────────────────────────────────────────────────

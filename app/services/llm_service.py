@@ -97,9 +97,10 @@ async def process_expense_from_text(
     Parse a natural language expense description using LLM.
     Returns structured expense data or error.
     """
-    # LLM feature is disabled: short-circuit before touching any provider so
-    # the app runs without GCP/genai. Flip settings.LLM_ENABLED to re-enable.
-    if not settings.LLM_ENABLED:
+    # LLM feature can be toggled at runtime from the admin dashboard.
+    from app.services.site_settings import get_site_settings
+    ss = await get_site_settings(db)
+    if not ss.get("llmEnabled", False):
         return {
             "message": "LLM feature is currently disabled",
             "llmoutput": {},
@@ -158,7 +159,10 @@ async def process_expense_from_receipt(
     db: AsyncIOMotorDatabase, image_base64: str, mime_type: str
 ) -> dict:
     """Parse a receipt image into structured expense data via the VL model."""
-    if not settings.LLM_ENABLED:
+    # LLM feature can be toggled at runtime from the admin dashboard.
+    from app.services.site_settings import get_site_settings
+    ss = await get_site_settings(db)
+    if not ss.get("llmEnabled", False):
         return {
             "message": "LLM feature is currently disabled",
             "llmoutput": {},
