@@ -2,15 +2,52 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.auth import get_account_user, get_current_user, get_verified_identity
 from app.database import get_db
-from app.services import user_service
+from app.services import device_auth_service, user_service
 from app.models.schemas import (
     ActivateRequest,
     ChangePasswordRequest,
+    DeviceAuthApproveRequest,
+    DeviceAuthPollRequest,
     LoginRequest,
     SignupRequest,
 )
 
 router = APIRouter()
+
+
+@router.post("/device-auth/start")
+async def start_device_auth(db: AsyncIOMotorDatabase = Depends(get_db)):
+    """Create a short-lived request. No account exists on this device yet."""
+    return await device_auth_service.start(db)
+
+
+@router.post("/device-auth/poll")
+async def poll_device_auth(
+    request: DeviceAuthPollRequest,
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Poll with the private device secret; approval is consumed once."""
+    return await device_auth_service.poll(
+        db, request.deviceCode, request.deviceSecret
+    )
+
+
+@router.post("/device-auth/approve")
+async def approve_device_auth(
+    request: DeviceAuthApproveRequest,
+    identity: dict = Depends(get_verified_identity),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Authorize a waiting device using this device's verified session."""
+    try:
+        result = await device_auth_service.approve(
+            db, request.deviceCode, identity.get("email", "")
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("reason"))
+    return {"message": "Device approved"}
 
 
 # /login and /signup use the verify-only dependency: get_current_user would

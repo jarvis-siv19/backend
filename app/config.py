@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     # Supabase (for asymmetric JWT validation)
     SUPABASE_URL: str = "https://your-project.supabase.co"
     SUPABASE_ANON_KEY: str = "your-anon-key"
-    # Service-role key (secret!) — only needed so account deletion can also
-    # remove the Supabase auth record. Leave empty to skip that step.
+    # Service-role key (secret!) — required for QR/device-code login, and also
+    # lets account deletion remove the Supabase auth record.
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 
     # LLM feature is disabled by default so the app can deploy and run before the

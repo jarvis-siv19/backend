@@ -161,3 +161,49 @@ def test_the_prompt_endpoint_carries_the_users_currency(client):
     body = response.json()
     assert "expenses" in body["prompt"]
     assert body["maxRows"] == bulk.MAX_ROWS
+
+
+def test_event_bulk_prompt_and_import_create_group_expenses(client):
+    account = client.get("/db/user/account").json()
+    event = client.post(
+        "/db/event",
+        json={"eventName": "AI Trip", "users": [account["id"]], "currency": "INR"},
+    ).json()
+    event_id = event["id"]
+
+    prompt = client.get(
+        "/db/expense/bulk/prompt", params={"eventId": event_id}
+    )
+    assert prompt.status_code == 200
+    assert "paidBy" in prompt.json()["prompt"]
+    assert "splitBetween" in prompt.json()["prompt"]
+    assert "Test User" in prompt.json()["prompt"]
+
+    batch = {
+        "eventId": event_id,
+        "payload": {"expenses": [{"name": "AI hotel", "amount": 1200}]},
+    }
+    preview = client.post("/db/expense/bulk/preview", json=batch)
+    assert preview.status_code == 200, preview.text
+    expense = preview.json()["rows"][0]["expense"]
+    assert expense["type"] == "group"
+    assert expense["eventId"] == event_id
+    assert expense["shares"][0]["userId"] == account["id"]
+
+    imported = client.post("/db/expense/bulk", json=batch)
+    assert imported.status_code == 200, imported.text
+    assert imported.json()["imported"] == 1
+    listed = client.get(f"/db/event/{event_id}/expenses").json()["expenses"]
+    assert any(row["expenseName"] == "AI hotel" for row in listed)
+
+
+def test_event_bulk_rejects_unknown_member_reference():
+    members = [{"id": "1", "name": "Sam", "email": "sam@example.com"}]
+    result = bulk.validate(
+        {"expenses": [{"name": "Taxi", "amount": 10, "paidBy": "Alex"}]},
+        members=members,
+        event_id="event-1",
+        default_payer_id="1",
+    )
+    assert not result["ok"]
+    assert "not in this event" in result["rows"][0]["errors"][0]

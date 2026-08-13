@@ -8,6 +8,7 @@ from app.services import (
     category_service,
     email_service,
     expense_service,
+    event_service,
     recurring_service,
     user_service,
 )
@@ -199,18 +200,41 @@ async def get_personal_expenses(
 # separate calls so nothing is written until the person has seen the rows.
 
 
+async def _bulk_event_context(db, user_id: str, event_id: str):
+    if not event_id:
+        return None, None
+    try:
+        allowed = await event_service.is_event_member(db, event_id, user_id)
+    except Exception:
+        allowed = False
+    if not allowed:
+        raise HTTPException(status_code=404, detail="Event not found")
+    event = await event_service.get_event_by_id(db, event_id)
+    return event, (event or {}).get("users", [])
+
+
 @router.get("/expense/bulk/prompt")
 async def get_bulk_prompt(
+    eventId: str = "",
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """The prompt to paste into whichever chatbot the person already uses."""
     account = await user_service.get_user_account(db, current_user["uid"])
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    event, members = await _bulk_event_context(db, user_id, eventId)
     return {
         "prompt": bulk_expense_service.build_prompt(
-            currency=(account or {}).get("defaultCurrency", "")
+            currency=(event or {}).get("currency")
+            or (account or {}).get("defaultCurrency", ""),
+            members=members,
+            event_name=(event or {}).get("eventName", ""),
         ),
-        "fields": bulk_expense_service.ROW_FIELDS,
+        "fields": (
+            bulk_expense_service.EVENT_ROW_FIELDS
+            if members
+            else bulk_expense_service.ROW_FIELDS
+        ),
         "maxRows": bulk_expense_service.MAX_ROWS,
     }
 
@@ -219,9 +243,17 @@ async def get_bulk_prompt(
 async def preview_bulk_expenses(
     request: BulkExpenseRequest,
     current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Check a batch and report exactly what would be created. Writes nothing."""
-    return bulk_expense_service.validate(request.payload)
+    user_id = await user_service.get_user_internal_id(db, current_user["uid"])
+    _, members = await _bulk_event_context(db, user_id, request.eventId or "")
+    return bulk_expense_service.validate(
+        request.payload,
+        members=members,
+        event_id=request.eventId or "",
+        default_payer_id=user_id,
+    )
 
 
 @router.post("/expense/bulk")
@@ -239,7 +271,13 @@ async def create_bulk_expenses(
     if not user_id:
         raise HTTPException(status_code=404, detail="User not found")
 
-    checked = bulk_expense_service.validate(request.payload)
+    _, members = await _bulk_event_context(db, user_id, request.eventId or "")
+    checked = bulk_expense_service.validate(
+        request.payload,
+        members=members,
+        event_id=request.eventId or "",
+        default_payer_id=user_id,
+    )
     if not checked.get("ok"):
         raise HTTPException(
             status_code=400,
@@ -252,14 +290,22 @@ async def create_bulk_expenses(
             failed.append(row)
             continue
         data = dict(row["expense"])
-        # A personal expense is paid by, and owed by, its creator in full;
-        # create_expense fills the shares in. Group rows are not supported yet.
-        data["type"] = "normal"
+        # Personal rows need no explicit shares. Event validation has already
+        # resolved member references into the exact group payload.
+        if not request.eventId:
+            data["type"] = "normal"
         result = await expense_service.create_expense(db, user_id, data)
         if result.get("success") == "false":
             failed.append({**row, "ok": False, "errors": [result.get("message", "rejected")]})
         else:
-            created.append(result.get("expenseId") or result.get("id"))
+            created.append(
+                result.get("expenseId")
+                or result.get("id")
+                or (result.get("data") or {}).get("id")
+            )
+            await _notify_expense_members(
+                db, user_id, current_user.get("name", ""), result.get("data", {})
+            )
 
     return {
         "imported": len(created),

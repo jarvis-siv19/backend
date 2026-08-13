@@ -45,6 +45,19 @@ class ActivateRequest(BaseModel):
     inviteCode: str = ""
 
 
+class DeviceAuthPollRequest(BaseModel):
+    """Credentials held by the device waiting to be signed in."""
+
+    deviceCode: str
+    deviceSecret: str
+
+
+class DeviceAuthApproveRequest(BaseModel):
+    """The short code shown on the device being authorized."""
+
+    deviceCode: str
+
+
 # ─── Account ────────────────────────────────────────────────────────────
 
 class UpdateAccountRequest(BaseModel):

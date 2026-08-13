@@ -29,17 +29,32 @@ ROW_FIELDS = {
     "notes": "string, optional — anything worth keeping, otherwise omit",
 }
 
+EVENT_ROW_FIELDS = {
+    **ROW_FIELDS,
+    "paidBy": "string, optional — member name or email; you if omitted",
+    "splitBetween": "array of member names or emails, optional — everyone if omitted; split is equal",
+    "currency": "string, optional — 3-letter transaction currency; event currency if omitted",
+}
+
 MAX_ROWS = 200
 
 
-def build_prompt(currency: str = "") -> str:
+def build_prompt(
+    currency: str = "", *, members: list[dict] | None = None, event_name: str = ""
+) -> str:
     """The text a person pastes into whichever chatbot they already use.
 
     Generated from the same field list the validator enforces, so the two
     cannot drift: change ROW_FIELDS and both the instructions and the checking
     move together.
     """
-    fields = "\n".join(f"- {name}: {rule}" for name, rule in ROW_FIELDS.items())
+    row_fields = EVENT_ROW_FIELDS if members else ROW_FIELDS
+    fields = "\n".join(f"- {name}: {rule}" for name, rule in row_fields.items())
+    member_labels = [
+        f"{m.get('name') or 'Unnamed'}"
+        + (f" <{m.get('email')}>" if m.get("email") else "")
+        for m in (members or [])
+    ]
     example = json.dumps(
         {
             "expenses": [
@@ -56,7 +71,10 @@ def build_prompt(currency: str = "") -> str:
     )
     return (
         "Read the expenses below and return them as JSON.\n\n"
-        "Return ONLY a JSON object, no explanation, no markdown fence. It must\n"
+        + (f"These expenses belong to the event {event_name!r}.\n" if members else "")
+        + ("Event members (use these exact names or emails):\n- "
+           + "\n- ".join(member_labels) + "\n\n" if members else "")
+        + "Return ONLY a JSON object, no explanation, no markdown fence. It must\n"
         'have one key, "expenses", whose value is an array of objects with:\n\n'
         f"{fields}\n\n"
         + (f"Amounts are in {currency}. " if currency else "")
@@ -108,7 +126,42 @@ def _parse_date(value) -> tuple[str, str | None]:
         return today.isoformat(), f"date {value!r} was not understood; using today"
 
 
-def validate(payload) -> dict:
+def _member_by_reference(reference, members: list[dict]) -> tuple[dict | None, str | None]:
+    text = str(reference or "").strip().lower()
+    if not text:
+        return None, "member is empty"
+    exact = [m for m in members if text in {
+        str(m.get("id", "")).lower(),
+        str(m.get("email", "")).strip().lower(),
+        str(m.get("name", "")).strip().lower(),
+    }]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        return None, f"member {reference!r} is ambiguous; use their email"
+    return None, f"member {reference!r} is not in this event"
+
+
+def _equal_shares(amount: float, member_ids: list[str], event_id: str) -> list[dict]:
+    cents = int(round(amount * 100))
+    base, remainder = divmod(cents, len(member_ids))
+    return [
+        {
+            "userId": member_id,
+            "amount": (base + (1 if index < remainder else 0)) / 100,
+            "eventId": event_id,
+        }
+        for index, member_id in enumerate(member_ids)
+    ]
+
+
+def validate(
+    payload,
+    *,
+    members: list[dict] | None = None,
+    event_id: str = "",
+    default_payer_id: str = "",
+) -> dict:
     """Check a batch without writing anything.
 
     Returns every row either way — accepted rows carry the expense that would
@@ -172,17 +225,59 @@ def validate(payload) -> dict:
             results.append({"index": index, "ok": False, "errors": errors, "name": name})
             continue
 
+        expense = {
+            "expenseName": name,
+            "amount": amount,
+            "date": date,
+            "category": category,
+            "description": str(row.get("notes") or "").strip(),
+        }
+
+        if members:
+            payer = None
+            if row.get("paidBy") in (None, ""):
+                payer = next(
+                    (m for m in members if str(m.get("id")) == default_payer_id),
+                    None,
+                )
+            else:
+                payer, member_error = _member_by_reference(row.get("paidBy"), members)
+                if member_error:
+                    errors.append(f"paidBy: {member_error}")
+
+            raw_split = row.get("splitBetween")
+            split_members = members if raw_split is None else []
+            if raw_split is not None:
+                if not isinstance(raw_split, list) or not raw_split:
+                    errors.append("splitBetween must be a non-empty array")
+                else:
+                    for ref in raw_split:
+                        member, member_error = _member_by_reference(ref, members)
+                        if member_error:
+                            errors.append(f"splitBetween: {member_error}")
+                        elif member and member not in split_members:
+                            split_members.append(member)
+
+            if not payer:
+                errors.append("paidBy could not be resolved")
+            if errors:
+                results.append({"index": index, "ok": False, "errors": errors, "name": name})
+                continue
+
+            split_ids = [str(member["id"]) for member in split_members]
+            expense.update({
+                "type": "group",
+                "eventId": event_id,
+                "currency": str(row.get("currency") or "").strip().upper() or None,
+                "shares": _equal_shares(amount, split_ids, event_id),
+                "payShares": [{"userId": str(payer["id"]), "amount": amount}],
+            })
+
         results.append({
             "index": index,
             "ok": True,
             "warnings": warnings,
-            "expense": {
-                "expenseName": name,
-                "amount": amount,
-                "date": date,
-                "category": category,
-                "description": str(row.get("notes") or "").strip(),
-            },
+            "expense": expense,
         })
 
     return {

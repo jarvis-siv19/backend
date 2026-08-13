@@ -41,6 +41,10 @@ cp .env.example .env
 - **Supabase:** Stateless JWT validation — the API verifies the Supabase access token
   (Bearer JWT) against `${SUPABASE_URL}/auth/v1/.well-known/jwks.json` and reads the
   user id from the `sub` claim.
+- **QR/device-code login:** set `SUPABASE_SERVICE_ROLE_KEY` and make sure
+  `APP_BASE_URL` is the public Flutter web origin. The backend holds each
+  one-time handoff for at most ten minutes; the service-role key is never sent
+  to either client.
 - **QuickML (optional):** The LLM and receipt-scanning features call Catalyst
   QuickML endpoints, authenticated with a Zoho OAuth token (Self Client refresh
   flow). Left disabled (`LLM_ENABLED=false`) they are skipped entirely.
