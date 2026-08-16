@@ -177,7 +177,9 @@ def test_event_bulk_prompt_and_import_create_group_expenses(client):
     assert prompt.status_code == 200
     assert "paidBy" in prompt.json()["prompt"]
     assert "splitBetween" in prompt.json()["prompt"]
-    assert "Test User" in prompt.json()["prompt"]
+    # Earlier account tests update the shared fixture user's profile. The prompt
+    # must contain the current event member, rather than a stale seed value.
+    assert account["name"] in prompt.json()["prompt"]
 
     batch = {
         "eventId": event_id,

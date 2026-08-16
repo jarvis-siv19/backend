@@ -1,6 +1,7 @@
 import pytest
+from motor.motor_asyncio import AsyncIOMotorClient
 
-from app.database import get_db
+from app.config import settings
 
 
 def test_device_request_requires_its_private_secret(client):
@@ -29,11 +30,17 @@ def test_device_request_requires_its_private_secret(client):
 @pytest.mark.asyncio
 async def test_approved_device_token_is_consumed_once(client):
     body = client.post("/db/device-auth/start").json()
-    db = get_db()
-    await db.device_auth_requests.update_one(
-        {"deviceCode": body["deviceCode"]},
-        {"$set": {"status": "approved", "email": "test@example.com", "tokenHash": "once"}},
-    )
+    # TestClient owns the app's event loop. Use a client owned by this async
+    # test's loop for direct fixture setup, otherwise Motor raises a cross-loop
+    # Future error before the endpoint can be tested.
+    mongo = AsyncIOMotorClient(settings.MONGODB_URI)
+    try:
+        await mongo[settings.DB_NAME].device_auth_requests.update_one(
+            {"deviceCode": body["deviceCode"]},
+            {"$set": {"status": "approved", "email": "test@example.com", "tokenHash": "once"}},
+        )
+    finally:
+        mongo.close()
 
     payload = {
         "deviceCode": body["deviceCode"],
