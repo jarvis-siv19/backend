@@ -568,9 +568,30 @@ async def get_event_expenses_with_summary(
     expenses = await get_event_expenses(db, event_id)
     event = await db.event.find_one({"_id": ObjectId(event_id)})
 
+    # The event list needs the payer's display name as well as its balance
+    # summary. It previously omitted this field, causing every row to render
+    # the UI fallback "Unknown" despite a valid payShares record.
+    payer_ids = {
+        pay_share.get("userId")
+        for expense in expenses
+        for pay_share in expense.get("payShares", [])
+        if pay_share.get("userId")
+    }
+    payer_docs = await db.users.find(
+        {"_id": {"$in": list(payer_ids)}}, {"name": 1, "email": 1}
+    ).to_list(length=None) if payer_ids else []
+    payer_names = {
+        user["_id"]: user.get("name") or user.get("email") or "Unknown"
+        for user in payer_docs
+    }
+
     expenses_with_summary = []
     for expense in expenses:
         summary = _get_expense_share_summary(expense, user_id)
+        payers = [
+            payer_names.get(pay_share.get("userId"), "Unknown")
+            for pay_share in expense.get("payShares", [])
+        ]
         expenses_with_summary.append(
             {
                 "expenseName": expense.get("expenseName", ""),
@@ -584,6 +605,7 @@ async def get_event_expenses_with_summary(
                 ),
                 "originalCurrency": expense.get("currency", settings.DEFAULT_CURRENCY),
                 "category": expense.get("category", ""),
+                "paidByName": ", ".join(payers) if payers else "Unknown",
                 "user_summary": summary,
             }
         )

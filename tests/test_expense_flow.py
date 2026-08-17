@@ -71,6 +71,8 @@ def test_group_expense_from_split_screen_shape(client):
     event_expenses = client.get(f"/db/event/{event_id}/expenses").json()
     names = [e["expenseName"] for e in event_expenses["expenses"]]
     assert "Hotel" in names
+    hotel = next(e for e in event_expenses["expenses"] if e["expenseName"] == "Hotel")
+    assert hotel["paidByName"] == account["name"]
 
 
 def test_editing_a_personal_expense_keeps_its_split(client):
